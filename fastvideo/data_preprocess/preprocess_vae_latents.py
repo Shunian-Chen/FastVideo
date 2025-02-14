@@ -12,6 +12,13 @@ from tqdm import tqdm
 from fastvideo.dataset import getdataset
 from fastvideo.utils.load import load_vae
 
+from fastvideo.dataset.video_processor import VideoProcessor
+from fastvideo.dataset.sgm.utils.audio_processor import AudioProcessor
+from fastvideo.dataset.sgm.utils.image_processor import ImageProcessorForDataProcessing
+from pathlib import Path
+import time
+import logging
+
 logger = get_logger(__name__)
 
 
@@ -19,6 +26,28 @@ def main(args):
     local_rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
     print("world_size", world_size, "local rank", local_rank)
+    
+    face_analysis_model_path = "./data/face_audio/face_analysis"
+    landmark_model_path = "./data/face_audio/face_analysis/models/face_landmarker_v2_with_blendshapes.task"
+    audio_separator_model_file = "./data/face_audio/audio_separator/Kim_Vocal_2.onnx"
+    wav2vec_model_path = './data/face_audio/wav2vec/wav2vec2-base-960h'
+    output_dir = Path("./output")
+    
+    audio_processor = AudioProcessor(
+        16000,
+        wav2vec_model_path,
+        False,
+        os.path.dirname(audio_separator_model_file),
+        os.path.basename(audio_separator_model_file),
+        os.path.join(output_dir, "vocals"),
+    )
+
+    image_processor = ImageProcessorForDataProcessing(
+        face_analysis_model_path, landmark_model_path)
+    args.video_processor = VideoProcessor(output_dir,
+                                          image_processor=image_processor,
+                                          audio_processor=audio_processor)
+    
     train_dataset = getdataset(args)
     sampler = DistributedSampler(train_dataset,
                                  rank=local_rank,
@@ -45,22 +74,33 @@ def main(args):
     os.makedirs(os.path.join(args.output_dir, "latent"), exist_ok=True)
 
     json_data = []
-    for _, data in tqdm(enumerate(train_dataloader), disable=local_rank != 0):
+    for i, data in tqdm(enumerate(train_dataloader), disable=local_rank != 0):
+        # if i >= 2:
+        #     break
         with torch.inference_mode():
             with torch.autocast("cuda", dtype=autocast_type):
+                start_time = time.time()
                 latents = vae.encode(data["pixel_values"].to(
                     encoder_device))["latent_dist"].sample()
+                elapsed_time = time.time() - start_time
+                logging.info(f"[time] VAE encoding and latent sampling completed in {elapsed_time:.2f} seconds")
             for idx, video_path in enumerate(data["path"]):
                 video_name = os.path.basename(video_path).split(".")[0]
+                timestamp = data.get("timestamp", "")
+                frames = int(data.get("frames", 0))
+                if isinstance(timestamp, list) and frames > 0:
+                    timestamp = "_" + str(frames) + "f_" + timestamp[0]
+                elif isinstance(timestamp, str) and timestamp != "" and frames > 0:
+                    timestamp = "_" + str(frames) + "f_" + timestamp
                 latent_path = os.path.join(args.output_dir, "latent",
-                                           video_name + ".pt")
+                                           video_name + timestamp + ".pt")
                 torch.save(latents[idx].to(torch.bfloat16), latent_path)
                 item = {}
                 item["length"] = latents[idx].shape[1]
                 item["latent_path"] = video_name + ".pt"
                 item["caption"] = data["text"][idx]
                 json_data.append(item)
-                print(f"{video_name} processed")
+                print(f"{video_name} processed\n")
     dist.barrier()
     local_data = json_data
     gathered_data = [None] * world_size
