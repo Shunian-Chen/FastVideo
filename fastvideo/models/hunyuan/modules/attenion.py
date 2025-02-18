@@ -88,3 +88,88 @@ def parallel_attention(q, k, v, img_q_len, img_kv_len, text_mask):
     attn = attn.reshape(b, s, -1)
 
     return attn
+
+class CrossAttention(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        heads_num: int,
+        qk_norm: bool = True,
+        qk_norm_type: str = "rms",
+        attention_dropout: float = 0.1,
+        output_dropout: float = 0.1,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        
+        if hidden_size % heads_num != 0:
+            raise ValueError(
+                f"hidden_size ({hidden_size}) must be divisible by heads_num ({heads_num})"
+            )
+        
+        self.hidden_size = hidden_size
+        self.num_attention_heads = heads_num
+        self.hidden_size_per_attention_head = hidden_size // heads_num
+        
+        # Projections
+        self.query = nn.Linear(hidden_size, hidden_size, bias=True, **factory_kwargs)
+        self.key_value = nn.Linear(hidden_size, 2 * hidden_size, bias=True, **factory_kwargs)
+        self.dense = nn.Linear(hidden_size, hidden_size, bias=True, **factory_kwargs)
+        
+        # Normalization
+        qk_norm_layer = get_norm_layer(qk_norm_type)
+        norm_args = {
+            "eps": 1e-6,
+            "elementwise_affine": True,
+            **factory_kwargs
+        }
+        self.q_norm = qk_norm_layer(self.hidden_size_per_attention_head, **norm_args) if qk_norm else nn.Identity()
+        self.k_norm = qk_norm_layer(self.hidden_size_per_attention_head, **norm_args) if qk_norm else nn.Identity()
+        
+        # Dropout
+        self.attention_dropout = nn.Dropout(attention_dropout)
+        self.output_dropout = nn.Dropout(output_dropout)
+        
+        # 初始化参数
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.query.weight)
+        nn.init.xavier_uniform_(self.key_value.weight)
+        nn.init.xavier_uniform_(self.dense.weight)
+        nn.init.zeros_(self.query.bias)
+        nn.init.zeros_(self.key_value.bias)
+        nn.init.zeros_(self.dense.bias)
+
+    def _transpose_for_scores(self, tensor):
+        new_shape = tensor.size()[:-1] + (self.num_attention_heads, self.hidden_size_per_attention_head)
+        return tensor.view(new_shape).permute(0, 2, 1, 3)
+
+    def forward(self, hidden_states, encoder_outputs):
+        # Query projection
+        query = self._transpose_for_scores(self.query(hidden_states))
+        query = self.q_norm(query)
+        
+        # Key-Value projection
+        kv = self.key_value(encoder_outputs)
+        key, value = torch.chunk(kv, 2, dim=-1)
+        key = self._transpose_for_scores(key)
+        value = self._transpose_for_scores(value)
+        key = self.k_norm(key)
+        
+        # Scaled dot-product attention
+        scale = math.sqrt(self.hidden_size_per_attention_head)
+        context = scaled_dot_product_attention(
+            query, key, value,
+            dropout_p=self.attention_dropout.p if self.training else 0.0,
+            scale=1.0/scale
+        )
+        
+        # Output projection
+        context = context.permute(0, 2, 1, 3).contiguous()
+        context = context.view(context.size()[:-2] + (self.hidden_size,))
+        output = self.output_dropout(self.dense(context))
+        
+        return output
