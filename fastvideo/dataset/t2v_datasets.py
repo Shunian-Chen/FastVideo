@@ -84,7 +84,7 @@ class T2V_dataset(Dataset):
                  video_processor = None
                 ):
         self.gpu_rank = args.gpu_rank   # new
-        self.video_processor = video_processor  # new
+        self.video_processor = args.video_processor  # new
         self.data = args.data_merge_path
         self.num_frames = args.num_frames
         self.train_fps = args.train_fps
@@ -435,7 +435,7 @@ class T2V_dataset(Dataset):
         print(folder_anno)
         for folder, anno in folder_anno:
             with open(anno, "r") as f:
-                sub_list = json.load(f)
+                sub_list = json.load(f)[:10]
             for i in range(len(sub_list)):
                 sub_list[i]["path"] = opj(folder, sub_list[i]["path"])
             cap_lists += sub_list
