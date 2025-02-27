@@ -1,5 +1,5 @@
 import torch
-
+from loguru import logger
 mochi_latents_mean = torch.tensor([
     -0.06730895953510081,
     -0.038011381506090416,
@@ -32,6 +32,7 @@ mochi_scaling_factor = 1.0
 
 
 def normalize_dit_input(model_type, latents):
+    logger.info(f"model_type: {model_type}")
     if model_type == "mochi":
         latents_mean = mochi_latents_mean.to(latents.device, latents.dtype)
         latents_std = mochi_latents_std.to(latents.device, latents.dtype)
@@ -41,5 +42,12 @@ def normalize_dit_input(model_type, latents):
         return latents * 0.476986
     elif model_type == "hunyuan":
         return latents * 0.476986
+    elif model_type == "hunyuan_audio":
+        logger.info(f"inside hunyuan_audio")
+        logger.info(f"latents: {latents.shape}, device: {latents.device}, dtype: {latents.dtype}")
+        
+        result = latents * 0.476986
+        logger.info(f"归一化完成，结果形状: {result.shape}")
+        return result
     else:
         raise NotImplementedError(f"model_type {model_type} not supported")

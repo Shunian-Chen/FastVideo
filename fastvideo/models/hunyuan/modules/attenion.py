@@ -1,5 +1,11 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import math
+from typing import Optional
+from torch.nn.functional import scaled_dot_product_attention
+from .norm_layers import get_norm_layer
+
 
 from fastvideo.models.flash_attn_no_pad import flash_attn_no_pad
 from fastvideo.utils.communications import all_gather, all_to_all_4D
@@ -32,7 +38,7 @@ def attention(
     return out
 
 
-def parallel_attention(q, k, v, img_q_len, img_kv_len, text_mask):
+def parallel_attention(q, k, v, img_q_len, img_kv_len, text_mask = None):
     # 1GPU torch.Size([1, 11264, 24, 128]) tensor([    0, 11275, 11520], device='cuda:0', dtype=torch.int32)
     # 2GPU torch.Size([1, 5632, 24, 128]) tensor([   0, 5643, 5888], device='cuda:0', dtype=torch.int32)
     query, encoder_query = q
@@ -64,7 +70,10 @@ def parallel_attention(q, k, v, img_q_len, img_kv_len, text_mask):
     # B, S, 3, H, D
     qkv = torch.stack([query, key, value], dim=2)
 
-    attn_mask = F.pad(text_mask, (sequence_length, 0), value=True)
+    if text_mask is not None:
+        attn_mask = F.pad(text_mask, (sequence_length, 0), value=True)
+    else:
+        attn_mask = None
     hidden_states = flash_attn_no_pad(qkv,
                                       attn_mask,
                                       causal=False,

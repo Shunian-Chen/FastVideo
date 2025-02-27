@@ -9,6 +9,9 @@ from transformers import AutoTokenizer, T5EncoderModel
 
 from fastvideo.models.hunyuan.modules.models import (
     HYVideoDiffusionTransformer, MMDoubleStreamBlock, MMSingleStreamBlock)
+
+from fastvideo.models.hunyuan.modules.model_audio import (
+    HYVideoDiffusionTransformerAudio, MMDoubleStreamBlockAudio, MMSingleStreamBlockAudio)
 from fastvideo.models.hunyuan.text_encoder import TextEncoder
 from fastvideo.models.hunyuan.vae.autoencoder_kl_causal_3d import \
     AutoencoderKLCausal3D
@@ -246,6 +249,27 @@ def load_hunyuan_state_dict(model, dit_model_name_or_path):
     model.load_state_dict(state_dict, strict=True)
     return model
 
+def load_hunyuan_audio_state_dict(model, dit_model_name_or_path):
+    load_key = "module"
+    model_path = dit_model_name_or_path
+    bare_model = "unknown"
+
+    state_dict = torch.load(model_path,
+                            map_location=lambda storage, loc: storage,
+                            weights_only=True)
+
+    if bare_model == "unknown" and ("ema" in state_dict
+                                    or "module" in state_dict):
+        bare_model = False
+    if bare_model is False:
+        if load_key in state_dict:
+            state_dict = state_dict[load_key]
+        else:
+            raise KeyError(
+                f"Missing key: `{load_key}` in the checkpoint: {model_path}. The keys in the checkpoint "
+                f"are: {list(state_dict.keys())}.")
+    model.load_state_dict(state_dict, strict=False)
+    return model
 
 def load_transformer(
     model_type,
@@ -289,6 +313,17 @@ def load_transformer(
             dtype=master_weight_type,
         )
         transformer = load_hunyuan_state_dict(transformer,
+                                              dit_model_name_or_path)
+        if master_weight_type == torch.bfloat16:
+            transformer = transformer.bfloat16()
+    elif model_type == "hunyuan_audio":
+        transformer = HYVideoDiffusionTransformerAudio(
+            in_channels=16,
+            out_channels=16,
+            **hunyuan_config,
+            dtype=master_weight_type,
+        )
+        transformer = load_hunyuan_audio_state_dict(transformer,
                                               dit_model_name_or_path)
         if master_weight_type == torch.bfloat16:
             transformer = transformer.bfloat16()
@@ -363,6 +398,8 @@ def get_no_split_modules(transformer):
                 HunyuanVideoTransformerBlock)
     elif isinstance(transformer, HYVideoDiffusionTransformer):
         return (MMDoubleStreamBlock, MMSingleStreamBlock)
+    elif isinstance(transformer, HYVideoDiffusionTransformerAudio):
+        return (MMDoubleStreamBlockAudio, MMSingleStreamBlockAudio)
     else:
         raise ValueError(f"Unsupported transformer type: {type(transformer)}")
 

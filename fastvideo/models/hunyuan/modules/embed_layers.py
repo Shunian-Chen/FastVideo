@@ -171,8 +171,11 @@ class AudioProjModel(torch.nn.Module):
         channels=768,  # add a new parameter channels
         intermediate_dim=512,
         output_dim=768,
-        context_tokens=32
+        context_tokens=32,
+        dtype=None,
+        device=None,
     ):
+        factory_kwargs = {"dtype": dtype, "device": device}
         super().__init__()
 
         self.seq_len = seq_len
@@ -186,17 +189,18 @@ class AudioProjModel(torch.nn.Module):
         self.output_dim = output_dim
 
         # define multiple linear layers
-        self.proj1 = torch.nn.Linear(self.input_dim, intermediate_dim)
-        self.proj2 = torch.nn.Linear(intermediate_dim, intermediate_dim)
-        self.proj3 = torch.nn.Linear(intermediate_dim, context_tokens * output_dim)
+        self.proj1 = torch.nn.Linear(self.input_dim, intermediate_dim, **factory_kwargs)
+        self.proj2 = torch.nn.Linear(intermediate_dim, intermediate_dim, **factory_kwargs)
+        self.proj3 = torch.nn.Linear(intermediate_dim, context_tokens * output_dim, **factory_kwargs)
 
-        self.norm = torch.nn.LayerNorm(output_dim)
+        self.norm = torch.nn.LayerNorm(output_dim * context_tokens)
         
         self.conv1 = torch.nn.Conv1d(in_channels=context_tokens * output_dim,
                                      out_channels=context_tokens * output_dim,
                                      kernel_size=2,
                                      stride=2,
-                                     padding=0)
+                                     padding=0,
+                                     **factory_kwargs)
 
     def forward(self, audio_embeds):
         # merge
@@ -204,19 +208,15 @@ class AudioProjModel(torch.nn.Module):
         audio_embeds = rearrange(audio_embeds, "bz f w b c -> (bz f) w b c")
         batch_size, window_size, blocks, channels = audio_embeds.shape
         audio_embeds = audio_embeds.view(batch_size, window_size * blocks * channels)
-
         audio_embeds = torch.relu(self.proj1(audio_embeds))
         audio_embeds = torch.relu(self.proj2(audio_embeds))
-
         context_tokens = self.proj3(audio_embeds).reshape(
             batch_size, self.context_tokens, self.output_dim
         )
-
         # context_tokens = self.norm(context_tokens)
         context_tokens = rearrange(
             context_tokens, "(bz f) m c -> bz f (m c)", f=video_length
         )
-        
         b, f, c = context_tokens.shape
         for _ in range(2):
             context_tokens = context_tokens.permute(0, 2, 1)
@@ -230,8 +230,6 @@ class AudioProjModel(torch.nn.Module):
             else:
                 context_tokens = self.conv1(context_tokens)
                 context_tokens = context_tokens.reshape(b, c, context_tokens.shape[-1]).permute(0, 2, 1)
-        
-        context_tokens = rearrange(context_tokens, "b f (m c) -> b f m c", m=self.context_tokens) 
         context_tokens = self.norm(context_tokens)       
 
         return context_tokens
@@ -242,16 +240,19 @@ class FaceProjModel(torch.nn.Module):
         hidden_size=768,
         clip_embeddings_dim=512,
         clip_extra_context_tokens=4,
+        dtype=None,
+        device=None,
     ):
+        factory_kwargs = {"dtype": dtype, "device": device}
         super().__init__()
 
         self.generator = None
         self.hidden_size = hidden_size
         self.clip_extra_context_tokens = clip_extra_context_tokens
         self.proj = torch.nn.Linear(
-            clip_embeddings_dim, self.clip_extra_context_tokens * hidden_size
+            clip_embeddings_dim, self.clip_extra_context_tokens * hidden_size, **factory_kwargs
         )
-        self.norm = torch.nn.LayerNorm(hidden_size)
+        self.norm = torch.nn.LayerNorm(hidden_size, **factory_kwargs)
 
     def forward(self, embeds):
         clip_extra_context_tokens = self.proj(embeds).reshape(
