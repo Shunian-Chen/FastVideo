@@ -338,14 +338,14 @@ def load_vae(model_type, pretrained_model_name_or_path):
         vae = AutoencoderKLMochi.from_pretrained(
             pretrained_model_name_or_path,
             subfolder="vae",
-            torch_dtype=weight_dtype).to("cuda")
+            torch_dtype=weight_dtype)
         autocast_type = torch.bfloat16
         fps = 30
     elif model_type == "hunyuan_hf":
         vae = AutoencoderKLHunyuanVideo.from_pretrained(
             pretrained_model_name_or_path,
             subfolder="vae",
-            torch_dtype=weight_dtype).to("cuda")
+            torch_dtype=weight_dtype)
         autocast_type = torch.bfloat16
         fps = 24
     elif model_type == "hunyuan":
@@ -359,7 +359,7 @@ def load_vae(model_type, pretrained_model_name_or_path):
         vae_ckpt = Path(vae_path) / "pytorch_model.pt"
         assert vae_ckpt.exists(), f"VAE checkpoint not found: {vae_ckpt}"
 
-        ckpt = torch.load(vae_ckpt, map_location=vae.device, weights_only=True)
+        ckpt = torch.load(vae_ckpt, map_location="cpu", weights_only=True)
         if "state_dict" in ckpt:
             ckpt = ckpt["state_dict"]
         if any(k.startswith("vae.") for k in ckpt.keys()):
@@ -370,7 +370,6 @@ def load_vae(model_type, pretrained_model_name_or_path):
         vae.load_state_dict(ckpt)
         vae = vae.to(dtype=vae_precision)
         vae.requires_grad_(False)
-        vae = vae.to("cuda")
         vae.eval()
         autocast_type = torch.float32
         fps = 24

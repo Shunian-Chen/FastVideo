@@ -132,7 +132,7 @@ class T2V_dataset(Dataset):
         ## ------new code------
         if self.video_processor is not None or True:
             from pathlib import Path
-            timestamp = self.video_processor.process(Path(video_path), self.transform,
+            timestamp, face_mask_path, face_emb_path, audio_emb_path = self.video_processor.process(Path(video_path), self.transform,
                                          frame_indices)
             if timestamp == -1:
                 return {
@@ -142,7 +142,10 @@ class T2V_dataset(Dataset):
                     "cond_mask": [],
                     "path": [],
                     "timestamp": [],
-                    "frames": []
+                    "frames": [],
+                    "face_mask_path": [],
+                    "face_emb_path": [],
+                    "audio_emb_path": []
                 }
             # from datetime import datetime
             # timestamp = datetime.now().strftime("%m-%d-%H")
@@ -205,7 +208,10 @@ class T2V_dataset(Dataset):
             cond_mask=cond_mask,
             path=video_path,
             timestamp=timestamp,        # new
-            frames=len(frame_indices)   # new
+            frames=len(frame_indices),   # new
+            face_mask_path=face_mask_path,  # new
+            face_emb_path=face_emb_path,    # new
+            audio_emb_path=audio_emb_path,  # new
         )
         
     def set_checkpoint(self, n_used_elements):

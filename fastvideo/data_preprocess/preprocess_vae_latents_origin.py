@@ -180,6 +180,9 @@ def main(args):
                 item["length"] = latents[idx].shape[1]
                 item["latent_path"] = video_name + ".pt"
                 item["caption"] = data["text"][idx]
+                item["face_mask_path"] = data["face_mask_path"][idx]
+                item["face_emb_path"] = data["face_emb_path"][idx]
+                item["audio_emb_path"] = data["audio_emb_path"][idx]
                 json_data.append(item)
                 print(f"{video_name} 处理完成\n")
     

@@ -92,7 +92,7 @@ class VideoProcessor:
             audio_output_path = audio_output_dir / f'{new_video_path.stem}.wav'
             
             # 检查是否存在与原始视频同名的音频文件（用于没有音轨的视频）
-            original_audio_path = audio_output_path
+            original_audio_path = self.output_dir / 'original_audio' / f'{new_video_path.stem}.wav'
             
             # 如果视频有音频轨道，则从视频中提取音频
             if has_audio:
@@ -130,10 +130,13 @@ class VideoProcessor:
                 # shutil.rmtree(new_video_path)
                 # logging.info(f"Deleted temporary directory: {images_output_dir}")
         
-            cv2.imwrite(
-                str(dirs["face_mask"] / f"{video_path.stem}.png"), face_mask)
-            torch.save(face_emb, str(
-                dirs["face_emb"] / f"{video_path.stem}.pt"))
+            face_mask_path = dirs["face_mask"] / f"{video_path.stem}.png"
+            cv2.imwrite(str(face_mask_path), face_mask)
+            logging.info(f"Face mask saved to: {face_mask_path}")
+            
+            face_emb_path = dirs["face_emb"] / f"{video_path.stem}.pt"
+            torch.save(face_emb, str(face_emb_path))
+            logging.info(f"Face embedding saved to: {face_emb_path}")
             
             # 处理音频嵌入 - 检查音频文件是否存在，而不仅仅依赖于视频是否有音轨
             if audio_output_path.exists():
@@ -146,12 +149,13 @@ class VideoProcessor:
             else:
                 logging.warning(f"No audio file found at {audio_output_path}. Creating empty audio embedding.")
                 # 创建一个空的音频嵌入，或者使用默认值
-                return -1
+                return -1, -1, -1, -1
             
-            torch.save(audio_emb, str(
-                dirs["audio_emb"] / f"{new_video_path.stem}.pt"))
+            audio_emb_path = dirs["audio_emb"] / f"{video_path.stem}.pt"
+            torch.save(audio_emb, str(audio_emb_path))
+            logging.info(f"Audio embedding saved to: {audio_emb_path}")
                 
-            return timestamp
+            return timestamp, face_mask_path, face_emb_path, audio_emb_path
         except Exception as e:
             logging.error(f"Failed to process video {video_path}: {e}")
             raise
