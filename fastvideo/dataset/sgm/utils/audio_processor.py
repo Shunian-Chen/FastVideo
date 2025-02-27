@@ -17,7 +17,7 @@ from transformers import Wav2Vec2FeatureExtractor
 
 from ...sgm.models.wav2vec import Wav2VecModel
 from .util import resample_audio
-
+import logging
 
 class AudioProcessor:
     """
@@ -110,7 +110,8 @@ class AudioProcessor:
         try:
             assert seq_len == 93 or seq_len == 92, "audio length is not 93"
         except Exception as e:
-            import ipdb; ipdb.set_trace()
+            logging.error(f"audio length is not 93: {e}")
+            logging.error(f"audio length: {seq_len}")
         seq_len = 93
         ## end
 
