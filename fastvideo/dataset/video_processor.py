@@ -64,6 +64,16 @@ class VideoProcessor:
             timestamp = datetime.now().strftime("%m-%d-%H")
             new_video_path = self.output_dir / 'videos' / f"{video_path.stem}.mp4"
             new_video_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # 获取原始视频的fps
+            fps = get_fps(video_path)
+            
+            # 计算音频裁切的起止时间
+            start_frame = min(frame_indices)
+            end_frame = max(frame_indices)
+            start_time = start_frame / fps
+            end_time = (end_frame + 1) / fps
+            
             create_new_video(video_path, new_video_path, frame_indices)
             logging.info(f"New video created with frames {frame_indices}: {new_video_path}")
             
@@ -73,8 +83,6 @@ class VideoProcessor:
                 new_video_path, images_output_dir)
             logging.info(f"Images saved to: {images_output_dir}")
             
-            fps = get_fps(new_video_path)
-
             # 检查视频是否有音频轨道
             has_audio = has_audio_stream(new_video_path)
             
@@ -83,19 +91,31 @@ class VideoProcessor:
             audio_output_dir.mkdir(parents=True, exist_ok=True)
             audio_output_path = audio_output_dir / f'{new_video_path.stem}.wav'
             
-            # 如果视频有音频轨道，则提取音频
+            # 检查是否存在与原始视频同名的音频文件（用于没有音轨的视频）
+            original_audio_path = audio_output_path
+            
+            # 如果视频有音频轨道，则从视频中提取音频
             if has_audio:
                 audio_output_path = extract_audio_from_videos(
                     new_video_path, audio_output_path)
-                logging.info(f"Audio extracted to: {audio_output_path}")
+                logging.info(f"Audio extracted from video to: {audio_output_path}")
+            # 如果视频没有音频轨道，但存在同名音频文件，则裁切该音频文件
+            elif original_audio_path.exists():
+                logging.info(f"Video has no audio stream, but found audio file: {original_audio_path}")
+                # 创建临时音频文件路径
+                temp_audio_path = audio_output_dir / f"temp_{new_video_path.stem}.wav"
+                # 裁切音频
+                audio_output_path = trim_audio_file(
+                    original_audio_path, audio_output_path, start_time, end_time)
+                logging.info(f"Audio trimmed and saved to: {audio_output_path}")
             else:
-                logging.warning(f"Video {new_video_path} has no audio stream. Checking if audio file exists at expected location.")
+                logging.warning(f"Video {new_video_path} has no audio stream and no audio file found at {original_audio_path}.")
 
             # 计时
-            start_time = time.time()
+            start_time_proc = time.time()
             face_mask, face_emb, _, _, _ = self.image_processor.preprocess(
                 images_output_dir)
-            elapsed_time = time.time() - start_time
+            elapsed_time = time.time() - start_time_proc
             logging.info(f"[time] Image preprocessing completed in {elapsed_time:.2f} seconds")
             
             ## ------new code------
@@ -118,10 +138,10 @@ class VideoProcessor:
             # 处理音频嵌入 - 检查音频文件是否存在，而不仅仅依赖于视频是否有音轨
             if audio_output_path.exists():
                 # 计时
-                start_time = time.time()
+                start_time_proc = time.time()
                 audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=24.0)
                 # audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=fps)
-                elapsed_time = time.time() - start_time
+                elapsed_time = time.time() - start_time_proc
                 logging.info(f"[time] Audio preprocessing completed in {elapsed_time:.2f} seconds")    
             else:
                 logging.warning(f"No audio file found at {audio_output_path}. Creating empty audio embedding.")
@@ -224,6 +244,37 @@ def has_audio_stream(video_path):
     except Exception as e:
         logging.warning(f"Error checking audio stream: {e}")
         return False
+
+
+def trim_audio_file(input_audio_path, output_audio_path, start_time, end_time):
+    """
+    裁切音频文件，使其与视频的起止时间匹配
+    
+    Args:
+        input_audio_path: 输入音频文件路径
+        output_audio_path: 输出音频文件路径
+        start_time: 开始时间（秒）
+        end_time: 结束时间（秒）
+    
+    Returns:
+        输出音频文件路径
+    """
+    cmd = [
+        "ffmpeg", "-v", "error", "-y",
+        "-i", str(input_audio_path),
+        "-ss", f"{start_time:.6f}",
+        "-to", f"{end_time:.6f}",
+        "-c:a", "pcm_s16le",  # 使用无损编码
+        str(output_audio_path)
+    ]
+    
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        logging.info(f"Audio trimmed from {start_time:.2f}s to {end_time:.2f}s")
+        return output_audio_path
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error trimming audio: {e.stderr.decode()}")
+        raise e
 
 
 ## 原脚本2，问题是帧与时间戳可能略有偏差
