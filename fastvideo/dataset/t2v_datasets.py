@@ -135,18 +135,18 @@ class T2V_dataset(Dataset):
             timestamp, face_mask_path, face_emb_path, audio_emb_path = self.video_processor.process(Path(video_path), self.transform,
                                          frame_indices)
             if timestamp == -1:
-                return {
-                    "pixel_values": [],
-                    "text": [],
-                    "input_ids": [],
-                    "cond_mask": [],
-                    "path": [],
-                    "timestamp": [],
-                    "frames": [],
-                    "face_mask_path": [],
-                    "face_emb_path": [],
-                    "audio_emb_path": []
-                }
+                return dict(
+                    pixel_values=torch.tensor([]),
+                    text=torch.tensor([]),
+                    input_ids=torch.tensor([]),
+                    cond_mask=torch.tensor([]),
+                    path=torch.tensor([]),
+                    timestamp=torch.tensor([]),
+                    frames=torch.tensor([]),
+                    face_mask_path=torch.tensor([]),
+                    face_emb_path=torch.tensor([]),
+                    audio_emb_path=torch.tensor([])
+                )
             # from datetime import datetime
             # timestamp = datetime.now().strftime("%m-%d-%H")
             # video_name = os.path.splitext(os.path.basename(video_path))[0]
