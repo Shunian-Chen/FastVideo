@@ -89,7 +89,7 @@ def main(args):
                 elapsed_time = time.time() - start_time
                 logging.info(f"[time] VAE encoding and latent sampling completed in {elapsed_time:.2f} seconds")
             for idx, video_path in enumerate(data["path"]):
-                if data["pixel_values"] is None:
+                if len(video_path) == 0:
                     continue
                 video_name = os.path.basename(video_path).split(".")[0]
                 latent_path = os.path.join(args.output_dir, "latent",

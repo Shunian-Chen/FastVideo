@@ -136,13 +136,13 @@ class T2V_dataset(Dataset):
                                          frame_indices)
             if timestamp == -1:
                 return {
-                    "pixel_values": None,
-                    "text": None,
-                    "input_ids": None,
-                    "cond_mask": None,
-                    "path": video_path,
-                    "timestamp": None,
-                    "frames": len(frame_indices)
+                    "pixel_values": [],
+                    "text": [],
+                    "input_ids": [],
+                    "cond_mask": [],
+                    "path": [],
+                    "timestamp": [],
+                    "frames": []
                 }
             # from datetime import datetime
             # timestamp = datetime.now().strftime("%m-%d-%H")
