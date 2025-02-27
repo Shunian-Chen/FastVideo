@@ -140,36 +140,47 @@ def main(args):
                 json_data.append(item)
                 print(f"{video_name} 处理完成\n")
     
-    logging.info(f"[Rank {local_rank}] 所有批次处理完成，等待同步")
+    # 每个进程保存自己的JSON数据
+    rank_json_path = os.path.join(args.output_dir, f"videos2caption_rank{local_rank}.json")
+    logging.info(f"[Rank {local_rank}] 保存JSON数据到 {rank_json_path}")
+    try:
+        with open(rank_json_path, "w") as f:
+            json.dump(json_data, f, indent=4)
+        logging.info(f"[Rank {local_rank}] JSON数据保存成功")
+    except Exception as e:
+        logging.error(f"[Rank {local_rank}] 保存JSON数据时出错: {str(e)}")
+    
+    # 使用简单的barrier确保所有进程都完成了保存
     try:
         dist.barrier()
-        logging.info(f"[Rank {local_rank}] 同步完成")
+        logging.info(f"[Rank {local_rank}] 所有进程完成处理")
     except Exception as e:
         logging.error(f"[Rank {local_rank}] 同步出错: {str(e)}")
-        pass
     
-    logging.info(f"[Rank {local_rank}] 开始收集数据")
-    local_data = json_data
-    gathered_data = [None] * world_size
-    
-    try:
-        dist.all_gather_object(gathered_data, local_data)
-        logging.info(f"[Rank {local_rank}] 数据收集成功")
-    except Exception as e:
-        logging.error(f"[Rank {local_rank}] 数据收集出错: {str(e)}")
-        if local_rank == 0:
-            gathered_data = [local_data]
-    
+    # 只在rank 0上合并所有JSON文件
     if local_rank == 0:
-        valid_data = [sublist for sublist in gathered_data if sublist is not None]
+        logging.info(f"[Rank {local_rank}] 开始合并所有进程的JSON数据")
         all_json_data = []
-        for sublist in valid_data:
-            all_json_data.extend(sublist)
         
-        with open(os.path.join(args.output_dir, "videos2caption_temp.json"),
-                  "w") as f:
-            json.dump(all_json_data, f, indent=4)
-        logging.info(f"[Rank {local_rank}] JSON数据保存成功")
+        # 读取并合并所有进程的JSON文件
+        for rank in range(world_size):
+            rank_file = os.path.join(args.output_dir, f"videos2caption_rank{rank}.json")
+            if os.path.exists(rank_file):
+                try:
+                    with open(rank_file, "r") as f:
+                        rank_data = json.load(f)
+                        all_json_data.extend(rank_data)
+                    logging.info(f"[Rank {local_rank}] 成功读取并合并进程 {rank} 的数据")
+                except Exception as e:
+                    logging.error(f"[Rank {local_rank}] 读取进程 {rank} 的数据时出错: {str(e)}")
+        
+        # 保存合并后的JSON文件
+        try:
+            with open(os.path.join(args.output_dir, "videos2caption_temp.json"), "w") as f:
+                json.dump(all_json_data, f, indent=4)
+            logging.info(f"[Rank {local_rank}] 合并的JSON数据保存成功")
+        except Exception as e:
+            logging.error(f"[Rank {local_rank}] 保存合并的JSON数据时出错: {str(e)}")
 
 
 if __name__ == "__main__":
