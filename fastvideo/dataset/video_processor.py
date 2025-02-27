@@ -75,12 +75,19 @@ class VideoProcessor:
             
             fps = get_fps(new_video_path)
 
-            # audio_output_dir = self.output_dir / 'audios'
-            # audio_output_dir.mkdir(parents=True, exist_ok=True)
-            # audio_output_path = audio_output_dir / f'{new_video_path.stem}.wav'
-            # audio_output_path = extract_audio_from_videos(
-            #     new_video_path, audio_output_path)
-            # logging.info(f"Audio extracted to: {audio_output_path}")
+            # 检查视频是否有音频轨道
+            has_audio = has_audio_stream(new_video_path)
+            audio_output_path = None
+            
+            if has_audio:
+                audio_output_dir = self.output_dir / 'audios'
+                audio_output_dir.mkdir(parents=True, exist_ok=True)
+                audio_output_path = audio_output_dir / f'{new_video_path.stem}.wav'
+                audio_output_path = extract_audio_from_videos(
+                    new_video_path, audio_output_path)
+                logging.info(f"Audio extracted to: {audio_output_path}")
+            else:
+                logging.warning(f"Video {new_video_path} has no audio stream. Skipping audio extraction.")
 
             # 计时
             start_time = time.time()
@@ -105,20 +112,27 @@ class VideoProcessor:
                 str(dirs["face_mask"] / f"{video_path.stem}.png"), face_mask)
             torch.save(face_emb, str(
                 dirs["face_emb"] / f"{video_path.stem}.pt"))
-            audio_path = self.output_dir / "audios" / f"{new_video_path.stem}.wav"
             
-            # 计时
-            start_time = time.time()
-            audio_emb, _ = self.audio_processor.preprocess(audio_path, fps=24.0)
-            # audio_emb, _ = self.audio_processor.preprocess(audio_path, fps=fps)
-            elapsed_time = time.time() - start_time
-            logging.info(f"[time] Audio preprocessing completed in {elapsed_time:.2f} seconds")    
+            # 处理音频嵌入
+            if has_audio and audio_output_path and audio_output_path.exists():
+                # 计时
+                start_time = time.time()
+                audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=24.0)
+                # audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=fps)
+                elapsed_time = time.time() - start_time
+                logging.info(f"[time] Audio preprocessing completed in {elapsed_time:.2f} seconds")    
+            else:
+                logging.warning(f"No audio found for video {video_path}. Creating empty audio embedding.")
+                # 创建一个空的音频嵌入，或者使用默认值
+                audio_emb = torch.zeros((1, 1))  # 根据实际需要调整尺寸
             
             torch.save(audio_emb, str(
                 dirs["audio_emb"] / f"{new_video_path.stem}.pt"))
+                
             return timestamp
         except Exception as e:
             logging.error(f"Failed to process video {video_path}: {e}")
+            raise
 
 
 def create_new_video(original_video_path, new_video_path, frame_indices):
@@ -138,32 +152,76 @@ def create_new_video(original_video_path, new_video_path, frame_indices):
     start_time = start_frame / fps
     end_time   = (end_frame + 1) / fps
     
-    ##  构造滤镜，分别处理视频和音频
-    #   - 视频: 只保留 [start_frame, end_frame] 的帧
-    #   - 音频: 截取 [start_time, end_time] 这段音频
-    #   这里需要注意：FFmpeg 的 between(n,a,b) 是闭区间包含 a 和 b
-    filter_complex = (
-        f"[0:v]select='between(n,{start_frame},{end_frame})',"
-        f"setpts=N/FRAME_RATE/TB[v];"
-        f"[0:a]atrim={start_time}:{end_time},asetpts=N/SR/TB[a]"
-    )
+    # 首先检查视频是否有音频轨道
+    cmd_check_audio = [
+        "ffprobe", "-v", "error", 
+        "-select_streams", "a:0", 
+        "-show_entries", "stream=codec_type", 
+        "-of", "default=nw=1:nk=1", 
+        str(original_video_path)
+    ]
+    
+    try:
+        result = subprocess.run(cmd_check_audio, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        has_audio = result.stdout.decode().strip() == "audio"
+    except Exception as e:
+        logging.warning(f"Error checking audio stream: {e}")
+        has_audio = False
+    
+    # 根据是否有音频轨道构建不同的滤镜命令
+    if has_audio:
+        # 视频和音频都处理
+        filter_complex = (
+            f"[0:v]select='between(n,{start_frame},{end_frame})',"
+            f"setpts=N/FRAME_RATE/TB[v];"
+            f"[0:a]atrim={start_time}:{end_time},asetpts=N/SR/TB[a]"
+        )
+        map_options = ["-map", "[v]", "-map", "[a]"]
+    else:
+        # 只处理视频
+        filter_complex = (
+            f"[0:v]select='between(n,{start_frame},{end_frame})',"
+            f"setpts=N/FRAME_RATE/TB[v]"
+        )
+        map_options = ["-map", "[v]"]
     
     cmd = [
         "ffmpeg", "-v", "error", "-y",
         "-i", str(original_video_path),
-        "-filter_complex", filter_complex,
-        "-map", "[v]",  # 映射处理后的视频
-        "-map", "[a]",  # 映射处理后的音频
-        "-c:v", "libx264",  # 可自行调整视频编码器
-        "-c:a", "aac",      # 可自行调整音频编码器
-        str(new_video_path)
+        "-filter_complex", filter_complex
+    ] + map_options + [
+        "-c:v", "libx264"
     ]
+    
+    # 只有在有音频的情况下才添加音频编码器
+    if has_audio:
+        cmd.extend(["-c:a", "aac"])
+    
+    cmd.append(str(new_video_path))
 
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
         logging.error(f"Error creating new video: {e.stderr.decode()}")
         raise e
+
+
+def has_audio_stream(video_path):
+    """检查视频是否有音频轨道"""
+    cmd = [
+        "ffprobe", "-v", "error", 
+        "-select_streams", "a:0", 
+        "-show_entries", "stream=codec_type", 
+        "-of", "default=nw=1:nk=1", 
+        str(video_path)
+    ]
+    
+    try:
+        result = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return result.stdout.decode().strip() == "audio"
+    except Exception as e:
+        logging.warning(f"Error checking audio stream: {e}")
+        return False
 
 
 ## 原脚本2，问题是帧与时间戳可能略有偏差
