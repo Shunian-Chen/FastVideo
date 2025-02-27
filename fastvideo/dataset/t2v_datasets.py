@@ -147,24 +147,10 @@ class T2V_dataset(Dataset):
                     face_emb_path=torch.tensor([]),
                     audio_emb_path=torch.tensor([])
                 )
-            # from datetime import datetime
-            # timestamp = datetime.now().strftime("%m-%d-%H")
-            # video_name = os.path.splitext(os.path.basename(video_path))[0]
-            # json_file = f"frame_indices_shunian_{self.gpu_rank}_machine2.json"
-            # if os.path.exists(json_file):
-            #     with open(json_file, "r", encoding="utf-8") as f:
-            #         try:
-            #             data = json.load(f)
-            #         except json.JSONDecodeError:
-            #             data = {}
-            # else:
-            #     data = {}  # JSON 文件不存在，初始化为空
-
-            # # 更新 JSON 数据
-            # data[video_name] = [frame_indices[0],frame_indices[-1]]
-
-            # with open(json_file, "w", encoding="utf-8") as f:
-            #     json.dump(data, f, indent=4, ensure_ascii=False)
+            # 确保路径是字符串而不是Path对象
+            face_mask_path = str(face_mask_path) if face_mask_path is not None else None
+            face_emb_path = str(face_emb_path) if face_emb_path is not None else None
+            audio_emb_path = str(audio_emb_path) if audio_emb_path is not None else None
         ## ------end-----------
         
         torchvision_video, _, metadata = torchvision.io.read_video(

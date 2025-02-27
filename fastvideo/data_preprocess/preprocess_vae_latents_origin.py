@@ -23,6 +23,31 @@ import logging
 logger = get_logger(__name__)
 
 
+# 自定义collate函数，处理Path对象
+def custom_collate_fn(batch):
+    """
+    自定义collate函数，将Path对象转换为字符串
+    """
+    elem = batch[0]
+    if isinstance(elem, dict):
+        return {key: custom_collate_fn([d[key] for d in batch if key in d]) for key in elem}
+    elif isinstance(elem, (list, tuple)):
+        return type(elem)(custom_collate_fn(samples) for samples in zip(*batch))
+    elif isinstance(elem, Path):
+        # 将Path对象转换为字符串
+        return [str(path) for path in batch]
+    else:
+        # 使用默认的collate函数处理其他类型
+        try:
+            return torch.utils.data._utils.collate.default_collate(batch)
+        except TypeError:
+            # 如果默认collate失败，检查是否有Path对象
+            if any(isinstance(item, Path) for item in batch):
+                return [str(item) if isinstance(item, Path) else item for item in batch]
+            # 如果不是Path对象导致的错误，直接返回原始batch
+            return batch
+
+
 def main(args):
     local_rank = int(os.getenv("LOCAL_RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
@@ -91,7 +116,8 @@ def main(args):
         sampler=sampler,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
-        shuffle=(sampler is None)  # 如果没有sampler，则启用shuffle
+        shuffle=(sampler is None),  # 如果没有sampler，则启用shuffle
+        collate_fn=custom_collate_fn  # 使用自定义的collate函数
     )
     logging.info(f"[Rank {local_rank}] 数据加载器创建完成，共有 {len(train_dataloader)} 批次")
 
@@ -120,6 +146,18 @@ def main(args):
         if len(data["path"]) == 0:
             logging.info(f"[Rank {local_rank}] 空批次，跳过")
             continue
+        
+        # 打印数据结构，帮助调试
+        if i == 0:
+            logging.info(f"[Rank {local_rank}] 数据结构: {', '.join(data.keys())}")
+            for key, value in data.items():
+                if isinstance(value, (list, tuple)):
+                    logging.info(f"[Rank {local_rank}] {key} 类型: {type(value)}, 长度: {len(value)}")
+                    if len(value) > 0:
+                        logging.info(f"[Rank {local_rank}] {key} 第一个元素类型: {type(value[0])}")
+                else:
+                    logging.info(f"[Rank {local_rank}] {key} 类型: {type(value)}")
+        
         with torch.inference_mode():
             with torch.autocast("cuda", dtype=autocast_type):
                 start_time = time.time()
@@ -153,6 +191,16 @@ def main(args):
                     
                     item["latent_path"] = video_name + ".pt"
                     item["caption"] = data["text"][idx]
+                    
+                    # 安全地添加其他字段
+                    for field in ["face_mask_path", "face_emb_path", "audio_emb_path"]:
+                        if field in data and idx < len(data[field]):
+                            field_value = data[field][idx]
+                            # 确保字段值是字符串而不是Path对象
+                            if isinstance(field_value, Path):
+                                field_value = str(field_value)
+                            item[field] = field_value
+                    
                     json_data.append(item)
                     continue
                 
@@ -180,9 +228,16 @@ def main(args):
                 item["length"] = latents[idx].shape[1]
                 item["latent_path"] = video_name + ".pt"
                 item["caption"] = data["text"][idx]
-                item["face_mask_path"] = data["face_mask_path"][idx]
-                item["face_emb_path"] = data["face_emb_path"][idx]
-                item["audio_emb_path"] = data["audio_emb_path"][idx]
+                
+                # 安全地添加其他字段
+                for field in ["face_mask_path", "face_emb_path", "audio_emb_path"]:
+                    if field in data and idx < len(data[field]):
+                        field_value = data[field][idx]
+                        # 确保字段值是字符串而不是Path对象
+                        if isinstance(field_value, Path):
+                            field_value = str(field_value)
+                        item[field] = field_value
+                
                 json_data.append(item)
                 print(f"{video_name} 处理完成\n")
     
