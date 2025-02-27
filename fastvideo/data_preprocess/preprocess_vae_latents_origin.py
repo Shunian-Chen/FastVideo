@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import datetime
 
 import torch
 import torch.distributed as dist
@@ -53,6 +54,8 @@ def main(args):
                                           audio_processor=audio_processor)
     
     train_dataset = getdataset(args)
+    logging.info(f"[Rank {local_rank}] Dataset size: {len(train_dataset)}")
+    
     sampler = DistributedSampler(train_dataset,
                                  rank=local_rank,
                                  num_replicas=world_size,
@@ -63,9 +66,10 @@ def main(args):
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
+    logging.info(f"[Rank {local_rank}] Dataloader created with {len(train_dataloader)} batches")
 
     encoder_device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu")
+        f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl",
@@ -73,15 +77,18 @@ def main(args):
                                 world_size=world_size,
                                 rank=local_rank)
     vae, autocast_type, fps = load_vae(args.model_type, args.model_path)
+    vae = vae.to(encoder_device)
     vae.enable_tiling()
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "latent"), exist_ok=True)
 
     json_data = []
     for i, data in tqdm(enumerate(train_dataloader), disable=local_rank != 0):
+        logging.info(f"[Rank {local_rank}] Processing batch {i}")
         # if i >= 2:
         #     break
         if len(data["path"]) == 0:
+            logging.info(f"[Rank {local_rank}] Empty batch, skipping")
             continue
         with torch.inference_mode():
             with torch.autocast("cuda", dtype=autocast_type):
@@ -89,14 +96,18 @@ def main(args):
                 latents = vae.encode(data["pixel_values"].to(
                     encoder_device))["latent_dist"].sample()
                 elapsed_time = time.time() - start_time
-                logging.info(f"[time] VAE encoding and latent sampling completed in {elapsed_time:.2f} seconds")
+                logging.info(f"[time] {local_rank}:VAE encoding and latent sampling completed in {elapsed_time:.2f} seconds")
+            
+            logging.info(f"[Rank {local_rank}] Processing {len(data['path'])} videos in batch")
             for idx, video_path in enumerate(data["path"]):
-
+                logging.info(f"[Rank {local_rank}] Processing video {idx}: {video_path}")
                 video_name = os.path.basename(video_path).split(".")[0]
                 latent_path = os.path.join(args.output_dir, "latent",
                                            video_name + ".pt")
                 if os.path.exists(latent_path):
+                    logging.info(f"[Rank {local_rank}] File {latent_path} already exists, skipping")
                     continue
+                
                 video_name = os.path.basename(video_path).split(".")[0]
                 timestamp = data.get("timestamp", "")
                 frames = int(data.get("frames", 0))
@@ -104,26 +115,50 @@ def main(args):
                     timestamp = "_" + str(frames) + "f_" + timestamp[0]
                 elif isinstance(timestamp, str) and timestamp != "" and frames > 0:
                     timestamp = "_" + str(frames) + "f_" + timestamp
+                
                 # latent_path = os.path.join(args.output_dir, "latent",
                 #                            video_name + timestamp + ".pt")
                 latent_path = os.path.join(args.output_dir, "latent",
                                            video_name + ".pt")
-                torch.save(latents[idx].to(torch.bfloat16), latent_path)
+                
+                logging.info(f"[Rank {local_rank}] Saving latent to {latent_path}")
+                try:
+                    torch.save(latents[idx].to(torch.bfloat16), latent_path)
+                    logging.info(f"[Rank {local_rank}] Successfully saved latent to {latent_path}")
+                except Exception as e:
+                    logging.error(f"[Rank {local_rank}] Error saving latent: {str(e)}")
+                
                 item = {}
                 item["length"] = latents[idx].shape[1]
                 item["latent_path"] = video_name + ".pt"
                 item["caption"] = data["text"][idx]
                 json_data.append(item)
                 print(f"{video_name} processed\n")
-    dist.barrier()
+    
+    logging.info(f"[Rank {local_rank}] All batches processed, waiting at barrier")
+    try:
+        # 设置超时时间为60秒
+        dist.barrier(timeout=datetime.timedelta(seconds=60))
+    except Exception as e:
+        logging.error(f"[Rank {local_rank}] Barrier timeout: {str(e)}")
+        # 即使超时也继续执行
+        pass
+    
+    logging.info(f"[Rank {local_rank}] Passed barrier, gathering data")
     local_data = json_data
     gathered_data = [None] * world_size
-    dist.all_gather_object(gathered_data, local_data)
+    try:
+        dist.all_gather_object(gathered_data, local_data)
+        logging.info(f"[Rank {local_rank}] Data gathered successfully")
+    except Exception as e:
+        logging.error(f"[Rank {local_rank}] Error in all_gather_object: {str(e)}")
+    
     if local_rank == 0:
         all_json_data = [item for sublist in gathered_data for item in sublist]
         with open(os.path.join(args.output_dir, "videos2caption_temp.json"),
                   "w") as f:
             json.dump(all_json_data, f, indent=4)
+        logging.info(f"[Rank {local_rank}] JSON data saved successfully")
 
 
 if __name__ == "__main__":
