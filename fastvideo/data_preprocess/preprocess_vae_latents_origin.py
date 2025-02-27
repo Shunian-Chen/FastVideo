@@ -24,7 +24,7 @@ logger = get_logger(__name__)
 
 
 def main(args):
-    local_rank = int(os.getenv("RANK", 0))
+    local_rank = int(os.getenv("LOCAL_RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
     print("world_size: ", world_size, "local rank: ", local_rank)
     args.gpu_rank = local_rank
@@ -53,8 +53,23 @@ def main(args):
                                           image_processor=image_processor,
                                           audio_processor=audio_processor)
     
+    torch.cuda.set_device(local_rank)
+    
+    if not dist.is_initialized():
+        try:
+            dist.init_process_group(backend="nccl",
+                                    init_method="env://",
+                                    world_size=world_size,
+                                    rank=local_rank)
+            logging.info(f"[Rank {local_rank}] 分布式环境初始化成功")
+        except Exception as e:
+            logging.error(f"[Rank {local_rank}] 分布式环境初始化失败: {str(e)}")
+            return
+    
+    logging.info(f"[Rank {local_rank}] 使用GPU: {torch.cuda.current_device()}")
+    
     train_dataset = getdataset(args)
-    logging.info(f"[Rank {local_rank}] Dataset size: {len(train_dataset)}")
+    logging.info(f"[Rank {local_rank}] 数据集大小: {len(train_dataset)}")
     
     sampler = DistributedSampler(train_dataset,
                                  rank=local_rank,
@@ -66,16 +81,10 @@ def main(args):
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
-    logging.info(f"[Rank {local_rank}] Dataloader created with {len(train_dataloader)} batches")
+    logging.info(f"[Rank {local_rank}] 数据加载器创建完成，共有 {len(train_dataloader)} 批次")
 
-    encoder_device = torch.device(
-        f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    torch.cuda.set_device(local_rank)
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl",
-                                init_method="env://",
-                                world_size=world_size,
-                                rank=local_rank)
+    encoder_device = torch.device(f"cuda:{local_rank}")
+    
     vae, autocast_type, fps = load_vae(args.model_type, args.model_path)
     vae = vae.to(encoder_device)
     vae.enable_tiling()
@@ -84,11 +93,9 @@ def main(args):
 
     json_data = []
     for i, data in tqdm(enumerate(train_dataloader), disable=local_rank != 0):
-        logging.info(f"[Rank {local_rank}] Processing batch {i}")
-        # if i >= 2:
-        #     break
+        logging.info(f"[Rank {local_rank}] 处理批次 {i}")
         if len(data["path"]) == 0:
-            logging.info(f"[Rank {local_rank}] Empty batch, skipping")
+            logging.info(f"[Rank {local_rank}] 空批次，跳过")
             continue
         with torch.inference_mode():
             with torch.autocast("cuda", dtype=autocast_type):
@@ -96,16 +103,16 @@ def main(args):
                 latents = vae.encode(data["pixel_values"].to(
                     encoder_device))["latent_dist"].sample()
                 elapsed_time = time.time() - start_time
-                logging.info(f"[time] {local_rank}:VAE encoding and latent sampling completed in {elapsed_time:.2f} seconds")
+                logging.info(f"[time] {local_rank}:VAE编码和潜在采样完成，耗时 {elapsed_time:.2f} 秒")
             
-            logging.info(f"[Rank {local_rank}] Processing {len(data['path'])} videos in batch")
+            logging.info(f"[Rank {local_rank}] 处理批次中的 {len(data['path'])} 个视频")
             for idx, video_path in enumerate(data["path"]):
-                logging.info(f"[Rank {local_rank}] Processing video {idx}: {video_path}")
+                logging.info(f"[Rank {local_rank}] 处理视频 {idx}: {video_path}")
                 video_name = os.path.basename(video_path).split(".")[0]
                 latent_path = os.path.join(args.output_dir, "latent",
                                            video_name + ".pt")
                 if os.path.exists(latent_path):
-                    logging.info(f"[Rank {local_rank}] File {latent_path} already exists, skipping")
+                    logging.info(f"[Rank {local_rank}] 文件 {latent_path} 已存在，跳过")
                     continue
                 
                 video_name = os.path.basename(video_path).split(".")[0]
@@ -116,49 +123,53 @@ def main(args):
                 elif isinstance(timestamp, str) and timestamp != "" and frames > 0:
                     timestamp = "_" + str(frames) + "f_" + timestamp
                 
-                # latent_path = os.path.join(args.output_dir, "latent",
-                #                            video_name + timestamp + ".pt")
                 latent_path = os.path.join(args.output_dir, "latent",
                                            video_name + ".pt")
                 
-                logging.info(f"[Rank {local_rank}] Saving latent to {latent_path}")
+                logging.info(f"[Rank {local_rank}] 保存潜在表示到 {latent_path}")
                 try:
                     torch.save(latents[idx].to(torch.bfloat16), latent_path)
-                    logging.info(f"[Rank {local_rank}] Successfully saved latent to {latent_path}")
+                    logging.info(f"[Rank {local_rank}] 成功保存潜在表示到 {latent_path}")
                 except Exception as e:
-                    logging.error(f"[Rank {local_rank}] Error saving latent: {str(e)}")
+                    logging.error(f"[Rank {local_rank}] 保存潜在表示时出错: {str(e)}")
                 
                 item = {}
                 item["length"] = latents[idx].shape[1]
                 item["latent_path"] = video_name + ".pt"
                 item["caption"] = data["text"][idx]
                 json_data.append(item)
-                print(f"{video_name} processed\n")
+                print(f"{video_name} 处理完成\n")
     
-    logging.info(f"[Rank {local_rank}] All batches processed, waiting at barrier")
+    logging.info(f"[Rank {local_rank}] 所有批次处理完成，等待同步")
     try:
-        # 设置超时时间为60秒
-        dist.barrier(timeout=datetime.timedelta(seconds=60))
+        dist.barrier()
+        logging.info(f"[Rank {local_rank}] 同步完成")
     except Exception as e:
-        logging.error(f"[Rank {local_rank}] Barrier timeout: {str(e)}")
-        # 即使超时也继续执行
+        logging.error(f"[Rank {local_rank}] 同步出错: {str(e)}")
         pass
     
-    logging.info(f"[Rank {local_rank}] Passed barrier, gathering data")
+    logging.info(f"[Rank {local_rank}] 开始收集数据")
     local_data = json_data
     gathered_data = [None] * world_size
+    
     try:
         dist.all_gather_object(gathered_data, local_data)
-        logging.info(f"[Rank {local_rank}] Data gathered successfully")
+        logging.info(f"[Rank {local_rank}] 数据收集成功")
     except Exception as e:
-        logging.error(f"[Rank {local_rank}] Error in all_gather_object: {str(e)}")
+        logging.error(f"[Rank {local_rank}] 数据收集出错: {str(e)}")
+        if local_rank == 0:
+            gathered_data = [local_data]
     
     if local_rank == 0:
-        all_json_data = [item for sublist in gathered_data for item in sublist]
+        valid_data = [sublist for sublist in gathered_data if sublist is not None]
+        all_json_data = []
+        for sublist in valid_data:
+            all_json_data.extend(sublist)
+        
         with open(os.path.join(args.output_dir, "videos2caption_temp.json"),
                   "w") as f:
             json.dump(all_json_data, f, indent=4)
-        logging.info(f"[Rank {local_rank}] JSON data saved successfully")
+        logging.info(f"[Rank {local_rank}] JSON数据保存成功")
 
 
 if __name__ == "__main__":
