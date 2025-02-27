@@ -25,14 +25,17 @@ logger = get_logger(__name__)
 def main(args):
     local_rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
-    print("world_size", world_size, "local rank", local_rank)
+    print("world_size: ", world_size, "local rank: ", local_rank)
     args.gpu_rank = local_rank
+    print("*"*100)
+    print("args.gpu_rank", args.gpu_rank)
+    print("*"*100)
 
     face_analysis_model_path = "./data/face_audio/face_analysis"
     landmark_model_path = "./data/face_audio/face_analysis/models/face_landmarker_v2_with_blendshapes.task"
     audio_separator_model_file = "./data/face_audio/audio_separator/Kim_Vocal_2.onnx"
     wav2vec_model_path = './data/face_audio/wav2vec/wav2vec2-base-960h'
-    output_dir = Path(f"./output_1k")
+    output_dir = Path(f"./data/Image-Vid-Finetune-HunYuan")
     
     audio_processor = AudioProcessor(
         16000,
@@ -86,6 +89,8 @@ def main(args):
                 elapsed_time = time.time() - start_time
                 logging.info(f"[time] VAE encoding and latent sampling completed in {elapsed_time:.2f} seconds")
             for idx, video_path in enumerate(data["path"]):
+                if data["pixel_values"] is None:
+                    continue
                 video_name = os.path.basename(video_path).split(".")[0]
                 latent_path = os.path.join(args.output_dir, "latent",
                                            video_name + ".pt")

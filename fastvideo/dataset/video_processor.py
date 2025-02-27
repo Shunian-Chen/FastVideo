@@ -126,7 +126,7 @@ class VideoProcessor:
             else:
                 logging.warning(f"No audio file found at {audio_output_path}. Creating empty audio embedding.")
                 # 创建一个空的音频嵌入，或者使用默认值
-                audio_emb = torch.zeros((1, 1))  # 根据实际需要调整尺寸
+                return -1
             
             torch.save(audio_emb, str(
                 dirs["audio_emb"] / f"{new_video_path.stem}.pt"))

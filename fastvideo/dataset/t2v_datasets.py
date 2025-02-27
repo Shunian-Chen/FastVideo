@@ -134,6 +134,16 @@ class T2V_dataset(Dataset):
             from pathlib import Path
             timestamp = self.video_processor.process(Path(video_path), self.transform,
                                          frame_indices)
+            if timestamp == -1:
+                return {
+                    "pixel_values": None,
+                    "text": None,
+                    "input_ids": None,
+                    "cond_mask": None,
+                    "path": video_path,
+                    "timestamp": None,
+                    "frames": len(frame_indices)
+                }
             # from datetime import datetime
             # timestamp = datetime.now().strftime("%m-%d-%H")
             # video_name = os.path.splitext(os.path.basename(video_path))[0]
