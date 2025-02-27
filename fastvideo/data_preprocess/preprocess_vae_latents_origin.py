@@ -81,6 +81,8 @@ def main(args):
     for i, data in tqdm(enumerate(train_dataloader), disable=local_rank != 0):
         # if i >= 2:
         #     break
+        if len(data["path"]) == 0:
+            continue
         with torch.inference_mode():
             with torch.autocast("cuda", dtype=autocast_type):
                 start_time = time.time()
@@ -89,8 +91,7 @@ def main(args):
                 elapsed_time = time.time() - start_time
                 logging.info(f"[time] VAE encoding and latent sampling completed in {elapsed_time:.2f} seconds")
             for idx, video_path in enumerate(data["path"]):
-                if len(video_path) == 0:
-                    continue
+
                 video_name = os.path.basename(video_path).split(".")[0]
                 latent_path = os.path.join(args.output_dir, "latent",
                                            video_name + ".pt")
