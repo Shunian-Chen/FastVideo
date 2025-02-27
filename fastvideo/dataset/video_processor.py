@@ -77,17 +77,19 @@ class VideoProcessor:
 
             # 检查视频是否有音频轨道
             has_audio = has_audio_stream(new_video_path)
-            audio_output_path = None
             
+            # 设置音频输出路径
+            audio_output_dir = self.output_dir / 'audios'
+            audio_output_dir.mkdir(parents=True, exist_ok=True)
+            audio_output_path = audio_output_dir / f'{new_video_path.stem}.wav'
+            
+            # 如果视频有音频轨道，则提取音频
             if has_audio:
-                audio_output_dir = self.output_dir / 'audios'
-                audio_output_dir.mkdir(parents=True, exist_ok=True)
-                audio_output_path = audio_output_dir / f'{new_video_path.stem}.wav'
                 audio_output_path = extract_audio_from_videos(
                     new_video_path, audio_output_path)
                 logging.info(f"Audio extracted to: {audio_output_path}")
             else:
-                logging.warning(f"Video {new_video_path} has no audio stream. Skipping audio extraction.")
+                logging.warning(f"Video {new_video_path} has no audio stream. Checking if audio file exists at expected location.")
 
             # 计时
             start_time = time.time()
@@ -113,8 +115,8 @@ class VideoProcessor:
             torch.save(face_emb, str(
                 dirs["face_emb"] / f"{video_path.stem}.pt"))
             
-            # 处理音频嵌入
-            if has_audio and audio_output_path and audio_output_path.exists():
+            # 处理音频嵌入 - 检查音频文件是否存在，而不仅仅依赖于视频是否有音轨
+            if audio_output_path.exists():
                 # 计时
                 start_time = time.time()
                 audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=24.0)
@@ -122,7 +124,7 @@ class VideoProcessor:
                 elapsed_time = time.time() - start_time
                 logging.info(f"[time] Audio preprocessing completed in {elapsed_time:.2f} seconds")    
             else:
-                logging.warning(f"No audio found for video {video_path}. Creating empty audio embedding.")
+                logging.warning(f"No audio file found at {audio_output_path}. Creating empty audio embedding.")
                 # 创建一个空的音频嵌入，或者使用默认值
                 audio_emb = torch.zeros((1, 1))  # 根据实际需要调整尺寸
             
