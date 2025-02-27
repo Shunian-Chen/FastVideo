@@ -80,7 +80,11 @@ def filter_resolution(h,
 class T2V_dataset(Dataset):
 
     def __init__(self, args, transform, temporal_sample, tokenizer,
-                 transform_topcrop):
+                 transform_topcrop,
+                 video_processor = None
+                ):
+        self.gpu_rank = args.gpu_rank   # new
+        self.video_processor = video_processor  # new
         self.data = args.data_merge_path
         self.num_frames = args.num_frames
         self.train_fps = args.train_fps
@@ -114,6 +118,86 @@ class T2V_dataset(Dataset):
 
         print(f"video length: {len(dataset_prog.cap_list)}", flush=True)
 
+    
+    def get_video_v2(self, idx, json_file="frame_indices_shunian.json"):
+        video_path = dataset_prog.cap_list[idx]["path"]
+        assert os.path.exists(video_path), f"file {video_path} do not exist!"
+        frame_indices = dataset_prog.cap_list[idx]["sample_frame_index"]
+        try:
+            assert len(frame_indices) == self.num_frames, f"frame_indices length is not equal to self.num_frames"
+        except AssertionError as e:
+            import ipdb; ipdb.set_trace()
+            # raise e
+
+        ## ------new code------
+        if self.video_processor is not None or True:
+            from pathlib import Path
+            timestamp = self.video_processor.process(Path(video_path), self.transform,
+                                         frame_indices)
+            # from datetime import datetime
+            # timestamp = datetime.now().strftime("%m-%d-%H")
+            # video_name = os.path.splitext(os.path.basename(video_path))[0]
+            # json_file = f"frame_indices_shunian_{self.gpu_rank}_machine2.json"
+            # if os.path.exists(json_file):
+            #     with open(json_file, "r", encoding="utf-8") as f:
+            #         try:
+            #             data = json.load(f)
+            #         except json.JSONDecodeError:
+            #             data = {}
+            # else:
+            #     data = {}  # JSON 文件不存在，初始化为空
+
+            # # 更新 JSON 数据
+            # data[video_name] = [frame_indices[0],frame_indices[-1]]
+
+            # with open(json_file, "w", encoding="utf-8") as f:
+            #     json.dump(data, f, indent=4, ensure_ascii=False)
+        ## ------end-----------
+        
+        torchvision_video, _, metadata = torchvision.io.read_video(
+            video_path, output_format="TCHW")
+        video = torchvision_video[frame_indices]
+        video = self.transform(video)
+        video = rearrange(video, "t c h w -> c t h w")
+        video = video.to(torch.uint8)
+        assert video.dtype == torch.uint8
+
+        h, w = video.shape[-2:]
+        assert (
+            h / w <= 17 / 16 and h / w >= 8 / 16
+        ), f"Only videos with a ratio (h/w) less than 17/16 and more than 8/16 are supported. But video ({video_path}) found ratio is {round(h / w, 2)} with the shape of {video.shape}"
+
+        video = video.float() / 127.5 - 1.0
+
+        text = dataset_prog.cap_list[idx]["cap"]
+        if not isinstance(text, list):
+            text = [text]
+        text = [random.choice(text)]
+
+        text = text[0] if random.random() > self.cfg else ""
+        
+        text_tokens_and_mask = self.tokenizer(
+            text,
+            max_length=self.text_max_length,
+            padding="max_length",
+            truncation=True,
+            return_attention_mask=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        )
+
+        input_ids = text_tokens_and_mask["input_ids"]
+        cond_mask = text_tokens_and_mask["attention_mask"]
+        return dict(
+            pixel_values=video,
+            text=text,
+            input_ids=input_ids,
+            cond_mask=cond_mask,
+            path=video_path,
+            timestamp=timestamp,        # new
+            frames=len(frame_indices)   # new
+        )
+        
     def set_checkpoint(self, n_used_elements):
         for i in range(len(dataset_prog.n_used_elements)):
             dataset_prog.n_used_elements[i] = n_used_elements
@@ -129,7 +213,8 @@ class T2V_dataset(Dataset):
     def get_data(self, idx):
         path = dataset_prog.cap_list[idx]["path"]
         if path.endswith(".mp4"):
-            return self.get_video(idx)
+            # return self.get_video(idx)
+            return self.get_video_v2(idx)
         else:
             return self.get_image(idx)
 
@@ -265,7 +350,7 @@ class T2V_dataset(Dataset):
                         min_h_div_w_ratio=1 / hw_aspect_thr * aspect,
                     )
                     if not is_pick:
-                        print("resolution mismatch")
+                        # print("resolution mismatch")
                         cnt_resolution_mismatch += 1
                         continue
 
@@ -295,6 +380,8 @@ class T2V_dataset(Dataset):
                     begin_index, end_index = self.temporal_sample(
                         len(frame_indices))
                     frame_indices = frame_indices[begin_index:end_index]
+                    if len(frame_indices) != self.num_frames:
+                        print("error")
                     # frame_indices = frame_indices[:self.num_frames]  # head crop
                 i["sample_frame_index"] = frame_indices.tolist()
                 new_cap_list.append(i)

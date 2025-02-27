@@ -9,6 +9,7 @@ import numpy as np
 import subprocess
 from datetime import datetime
 import time
+from typing import Dict, List, Tuple
 
 from .sgm.utils.audio_processor import AudioProcessor
 from .sgm.utils.image_processor import ImageProcessorForDataProcessing
@@ -53,7 +54,7 @@ class VideoProcessor:
 
     def process(self, video_path: Path,
              transform, 
-             frame_indices: list[int]
+             frame_indices: List[int]
              ) -> None:
         assert video_path.exists(), f"Video path {video_path} does not exist"
         dirs = setup_directories(video_path)
@@ -74,12 +75,12 @@ class VideoProcessor:
             
             fps = get_fps(new_video_path)
 
-            audio_output_dir = self.output_dir / 'audios'
-            audio_output_dir.mkdir(parents=True, exist_ok=True)
-            audio_output_path = audio_output_dir / f'{new_video_path.stem}.wav'
-            audio_output_path = extract_audio_from_videos(
-                new_video_path, audio_output_path)
-            logging.info(f"Audio extracted to: {audio_output_path}")
+            # audio_output_dir = self.output_dir / 'audios'
+            # audio_output_dir.mkdir(parents=True, exist_ok=True)
+            # audio_output_path = audio_output_dir / f'{new_video_path.stem}.wav'
+            # audio_output_path = extract_audio_from_videos(
+            #     new_video_path, audio_output_path)
+            # logging.info(f"Audio extracted to: {audio_output_path}")
 
             # 计时
             start_time = time.time()

@@ -87,6 +87,11 @@ def main(args):
                 logging.info(f"[time] VAE encoding and latent sampling completed in {elapsed_time:.2f} seconds")
             for idx, video_path in enumerate(data["path"]):
                 video_name = os.path.basename(video_path).split(".")[0]
+                latent_path = os.path.join(args.output_dir, "latent",
+                                           video_name + ".pt")
+                if os.path.exists(latent_path):
+                    continue
+                video_name = os.path.basename(video_path).split(".")[0]
                 timestamp = data.get("timestamp", "")
                 frames = int(data.get("frames", 0))
                 if isinstance(timestamp, list) and frames > 0:
