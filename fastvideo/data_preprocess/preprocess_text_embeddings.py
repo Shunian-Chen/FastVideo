@@ -26,13 +26,18 @@ class T5dataset(Dataset):
         self.json_path = json_path
         self.vae_debug = vae_debug
         with open(self.json_path, "r") as f:
+            # train_dataset = json.load(f)[1000:2000]
             train_dataset = json.load(f)
             self.train_dataset = sorted(train_dataset,
                                         key=lambda x: x["latent_path"])
 
     def __getitem__(self, idx):
-        caption = self.train_dataset[idx]["caption"]
-        filename = self.train_dataset[idx]["latent_path"].split(".")[0]
+        caption = self.train_dataset[idx]["caption"][0]
+        filename = self.train_dataset[idx]["latent_path"].split(".")[0].split("/")[-1]
+        latent_path = self.train_dataset[idx]["latent_path"]
+        audio_emb_path = self.train_dataset[idx]["audio_emb_path"]
+        face_emb_path = self.train_dataset[idx]["face_emb_path"]
+
         length = self.train_dataset[idx]["length"]
         if self.vae_debug:
             latents = torch.load(
@@ -43,10 +48,17 @@ class T5dataset(Dataset):
         else:
             latents = []
 
+        # return dict(caption=caption,
+        #             latents=latents,
+        #             filename=filename,
+        #             length=length)
         return dict(caption=caption,
                     latents=latents,
                     filename=filename,
-                    length=length)
+                    length=length,
+                    latent_path=latent_path,
+                    audio_emb_path=audio_emb_path,
+                    face_emb_path=face_emb_path)
 
     def __len__(self):
         return len(self.train_dataset)
@@ -121,9 +133,11 @@ def main(args):
                         export_to_video(video[idx], video_path, fps=fps)
                     item = {}
                     item["length"] = int(data["length"][idx])
-                    item["latent_path"] = video_name + ".pt"
-                    item["prompt_embed_path"] = video_name + ".pt"
-                    item["prompt_attention_mask"] = video_name + ".pt"
+                    item["latent_path"] = data["latent_path"][idx]
+                    item["audio_emb_path"] = data["audio_emb_path"][idx]
+                    item["face_emb_path"] = data["face_emb_path"][idx]
+                    item["prompt_embed_path"] = prompt_embed_path
+                    item["prompt_attention_mask"] = prompt_attention_mask_path
                     item["caption"] = data["caption"][idx]
                     json_data.append(item)
     dist.barrier()
