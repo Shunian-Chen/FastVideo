@@ -268,7 +268,12 @@ def main(args):
                 # 处理视频以生成face_mask, face_emb和audio_emb
                 try:
                     # 获取frame_indices
-                    frame_indices = data.get("frame_indices", [])
+                    # 优先从sample_frame_index获取，这是t2v_datasets.py中使用的键名
+                    frame_indices = data.get("sample_frame_index", None)
+                    if frame_indices is None:
+                        # 尝试从frame_indices获取
+                        frame_indices = data.get("frame_indices", [])
+                        
                     if isinstance(frame_indices, torch.Tensor):
                         frame_indices = frame_indices[idx].cpu().numpy().tolist()
                     elif isinstance(frame_indices, list) and len(frame_indices) > idx:
@@ -276,6 +281,13 @@ def main(args):
                             frame_indices = frame_indices[idx].cpu().numpy().tolist()
                         else:
                             frame_indices = frame_indices[idx]
+                    
+                    # 检查frame_indices是否为空
+                    if not frame_indices:
+                        logging.error(f"[Rank {local_rank}] 视频 {video_name} 的frame_indices为空")
+                        continue
+                        
+                    logging.info(f"[Rank {local_rank}] 视频 {video_name} 的frame_indices: {frame_indices[:5]}...")
                     
                     # 获取transform
                     transform = data.get("transform", None)

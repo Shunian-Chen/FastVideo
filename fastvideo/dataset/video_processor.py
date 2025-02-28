@@ -68,6 +68,11 @@ class VideoProcessor:
             # 获取原始视频的fps
             fps = get_fps(video_path)
             
+            # 检查frame_indices是否为空
+            if not frame_indices:
+                logging.error(f"Empty frame_indices for video: {video_path}")
+                return timestamp, None, None, None
+            
             # 计算音频裁切的起止时间
             start_frame = min(frame_indices)
             end_frame = max(frame_indices)
