@@ -61,6 +61,17 @@ class VideoProcessor:
         logging.info(f"Processing video: {video_path}")
 
         try:
+            # 首先检查是否已经存在所有必要的文件
+            face_mask_path = dirs["face_mask"] / f"{video_path.stem}.png"
+            face_emb_path = dirs["face_emb"] / f"{video_path.stem}.pt"
+            audio_emb_path = dirs["audio_emb"] / f"{video_path.stem}.pt"
+            
+            # 如果所有文件都已存在，直接返回
+            if face_mask_path.exists() and face_emb_path.exists() and audio_emb_path.exists():
+                logging.info(f"所有必要文件已存在，跳过处理: {video_path.stem}")
+                timestamp = datetime.now().strftime("%m-%d-%H")
+                return timestamp, face_mask_path, face_emb_path, audio_emb_path
+            
             timestamp = datetime.now().strftime("%m-%d-%H")
             new_video_path = self.output_dir / 'videos' / f"{video_path.stem}.mp4"
             new_video_path.parent.mkdir(parents=True, exist_ok=True)
@@ -79,86 +90,107 @@ class VideoProcessor:
             start_time = start_frame / fps
             end_time = (end_frame + 1) / fps
             
-            create_new_video(video_path, new_video_path, frame_indices)
-            logging.info(f"New video created with frames {frame_indices}: {new_video_path}")
+            # 检查是否需要处理人脸相关文件
+            need_process_face = not (face_mask_path.exists() and face_emb_path.exists())
+            # 检查是否需要处理音频文件
+            need_process_audio = not audio_emb_path.exists()
             
-            images_output_dir = self.output_dir / 'images' / video_path.stem
-            images_output_dir.mkdir(parents=True, exist_ok=True)
-            images_output_dir = convert_video_to_images(
-                new_video_path, images_output_dir)
-            logging.info(f"Images saved to: {images_output_dir}")
+            # 如果需要处理任何一种文件，则需要创建新视频
+            if need_process_face or need_process_audio:
+                create_new_video(video_path, new_video_path, frame_indices)
+                logging.info(f"New video created with frames {frame_indices}: {new_video_path}")
             
-            # 检查视频是否有音频轨道
-            has_audio = has_audio_stream(new_video_path)
-            
-            # 设置音频输出路径
-            audio_output_dir = self.output_dir / 'audios'
-            audio_output_dir.mkdir(parents=True, exist_ok=True)
-            audio_output_path = audio_output_dir / f'{new_video_path.stem}.wav'
-            
-            # 检查是否存在与原始视频同名的音频文件（用于没有音轨的视频）
-            original_audio_path = self.output_dir / 'original_audio' / f'{new_video_path.stem}.wav'
-            
-            # 如果视频有音频轨道，则从视频中提取音频
-            if has_audio:
-                audio_output_path = extract_audio_from_videos(
-                    new_video_path, audio_output_path)
-                logging.info(f"Audio extracted from video to: {audio_output_path}")
-            # 如果视频没有音频轨道，但存在同名音频文件，则裁切该音频文件
-            elif original_audio_path.exists():
-                logging.info(f"Video has no audio stream, but found audio file: {original_audio_path}")
-                # 创建临时音频文件路径
-                temp_audio_path = audio_output_dir / f"temp_{new_video_path.stem}.wav"
-                # 裁切音频
-                audio_output_path = trim_audio_file(
-                    original_audio_path, audio_output_path, start_time, end_time)
-                logging.info(f"Audio trimmed and saved to: {audio_output_path}")
-            else:
-                logging.warning(f"Video {new_video_path} has no audio stream and no audio file found at {original_audio_path}.")
-
-            # 计时
-            start_time_proc = time.time()
-            face_mask, face_emb, _, _, _ = self.image_processor.preprocess(
-                images_output_dir)
-            elapsed_time = time.time() - start_time_proc
-            logging.info(f"[time] Image preprocessing completed in {elapsed_time:.2f} seconds")
-            
-            ## ------new code------
-            face_mask = torch.from_numpy(face_mask).unsqueeze(0).unsqueeze(0)   # (1, 1, H, W)
-            face_mask = transform(face_mask)                        # crop and resize
-            face_mask = face_mask.squeeze().cpu().numpy()           # (H, W)
-            face_mask = (face_mask > 0).astype(np.uint8) * 255      # 将插值产生的中间过渡值转换255
-            ## ------end-----------
-            
-            if images_output_dir.exists():
-                shutil.rmtree(images_output_dir)
-                # shutil.rmtree(new_video_path)
-                # logging.info(f"Deleted temporary directory: {images_output_dir}")
-        
-            face_mask_path = dirs["face_mask"] / f"{video_path.stem}.png"
-            cv2.imwrite(str(face_mask_path), face_mask)
-            logging.info(f"Face mask saved to: {face_mask_path}")
-            
-            face_emb_path = dirs["face_emb"] / f"{video_path.stem}.pt"
-            torch.save(face_emb, str(face_emb_path))
-            logging.info(f"Face embedding saved to: {face_emb_path}")
-            
-            # 处理音频嵌入 - 检查音频文件是否存在，而不仅仅依赖于视频是否有音轨
-            if audio_output_path.exists():
+            # 处理人脸相关文件
+            if need_process_face:
+                images_output_dir = self.output_dir / 'images' / video_path.stem
+                images_output_dir.mkdir(parents=True, exist_ok=True)
+                images_output_dir = convert_video_to_images(
+                    new_video_path, images_output_dir)
+                logging.info(f"Images saved to: {images_output_dir}")
+                
                 # 计时
                 start_time_proc = time.time()
-                audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=24.0)
-                # audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=fps)
+                face_mask, face_emb, _, _, _ = self.image_processor.preprocess(
+                    images_output_dir)
                 elapsed_time = time.time() - start_time_proc
-                logging.info(f"[time] Audio preprocessing completed in {elapsed_time:.2f} seconds")    
-            else:
-                logging.warning(f"No audio file found at {audio_output_path}. Creating empty audio embedding.")
-                # 创建一个空的音频嵌入，或者使用默认值
-                return -1, -1, -1, -1
+                logging.info(f"[time] Image preprocessing completed in {elapsed_time:.2f} seconds")
+                
+                ## ------new code------
+                face_mask = torch.from_numpy(face_mask).unsqueeze(0).unsqueeze(0)   # (1, 1, H, W)
+                face_mask = transform(face_mask)                        # crop and resize
+                face_mask = face_mask.squeeze().cpu().numpy()           # (H, W)
+                face_mask = (face_mask > 0).astype(np.uint8) * 255      # 将插值产生的中间过渡值转换255
+                ## ------end-----------
+                
+                if images_output_dir.exists():
+                    shutil.rmtree(images_output_dir)
+                    # logging.info(f"Deleted temporary directory: {images_output_dir}")
             
-            audio_emb_path = dirs["audio_emb"] / f"{video_path.stem}.pt"
-            torch.save(audio_emb, str(audio_emb_path))
-            logging.info(f"Audio embedding saved to: {audio_emb_path}")
+                cv2.imwrite(str(face_mask_path), face_mask)
+                logging.info(f"Face mask saved to: {face_mask_path}")
+                
+                torch.save(face_emb, str(face_emb_path))
+                logging.info(f"Face embedding saved to: {face_emb_path}")
+            else:
+                logging.info(f"人脸相关文件已存在，跳过处理: {face_mask_path}, {face_emb_path}")
+            
+            # 处理音频文件
+            if need_process_audio:
+                # 检查视频是否有音频轨道
+                has_audio = has_audio_stream(new_video_path)
+                
+                # 设置音频输出路径
+                audio_output_dir = self.output_dir / 'audios'
+                audio_output_dir.mkdir(parents=True, exist_ok=True)
+                audio_output_path = audio_output_dir / f'{new_video_path.stem}.wav'
+                
+                # 检查是否存在与原始视频同名的音频文件（用于没有音轨的视频）
+                original_audio_path = self.output_dir / 'original_audio' / f'{new_video_path.stem}.wav'
+                
+                # 如果视频有音频轨道，则从视频中提取音频
+                if has_audio:
+                    # 检查音频文件是否已存在
+                    if audio_output_path.exists():
+                        logging.info(f"音频文件已存在，跳过提取: {audio_output_path}")
+                    else:
+                        audio_output_path = extract_audio_from_videos(
+                            new_video_path, audio_output_path)
+                        logging.info(f"Audio extracted from video to: {audio_output_path}")
+                # 如果视频没有音频轨道，但存在同名音频文件，则裁切该音频文件
+                elif original_audio_path.exists():
+                    logging.info(f"Video has no audio stream, but found audio file: {original_audio_path}")
+                    # 裁切音频
+                    audio_output_path = trim_audio_file(
+                        original_audio_path, audio_output_path, start_time, end_time)
+                    logging.info(f"Audio trimmed and saved to: {audio_output_path}")
+                else:
+                    logging.warning(f"Video {new_video_path} has no audio stream and no audio file found at {original_audio_path}.")
+                    return timestamp, face_mask_path, face_emb_path, None
+                
+                # 处理音频嵌入 - 检查音频文件是否存在
+                if audio_output_path.exists():
+                    # 计时
+                    start_time_proc = time.time()
+                    audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=24.0)
+                    # audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=fps)
+                    elapsed_time = time.time() - start_time_proc
+                    logging.info(f"[time] Audio preprocessing completed in {elapsed_time:.2f} seconds")    
+                    
+                    torch.save(audio_emb, str(audio_emb_path))
+                    logging.info(f"Audio embedding saved to: {audio_emb_path}")
+                else:
+                    logging.warning(f"No audio file found at {audio_output_path}. Creating empty audio embedding.")
+                    return timestamp, face_mask_path, face_emb_path, None
+            else:
+                logging.info(f"音频嵌入文件已存在，跳过处理: {audio_emb_path}")
+            
+            # 清理临时视频文件
+            if new_video_path.exists() and not (need_process_face or need_process_audio):
+                try:
+                    os.remove(new_video_path)
+                    logging.info(f"删除临时视频文件: {new_video_path}")
+                except Exception as e:
+                    logging.warning(f"删除临时视频文件失败: {e}")
                 
             return timestamp, face_mask_path, face_emb_path, audio_emb_path
         except Exception as e:
@@ -268,6 +300,11 @@ def trim_audio_file(input_audio_path, output_audio_path, start_time, end_time):
     Returns:
         输出音频文件路径
     """
+    # 检查输出文件是否已存在
+    if os.path.exists(output_audio_path):
+        logging.info(f"音频文件已存在，跳过裁切: {output_audio_path}")
+        return output_audio_path
+        
     cmd = [
         "ffmpeg", "-v", "error", "-y",
         "-i", str(input_audio_path),
