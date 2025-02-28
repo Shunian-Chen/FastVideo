@@ -116,6 +116,19 @@ class VideoProcessor:
                 logging.info(f"[time] Image preprocessing completed in {elapsed_time:.2f} seconds")
                 
                 ## ------new code------
+                # 检查face_mask是否为None，如果是则创建一个空的掩码
+                if face_mask is None:
+                    logging.warning(f"No face detected in video: {video_path.stem}, creating empty face mask")
+                    # 获取视频的第一帧以确定尺寸
+                    first_frame_path = next(images_output_dir.glob('*.png'), None)
+                    if first_frame_path:
+                        first_frame = cv2.imread(str(first_frame_path))
+                        height, width = first_frame.shape[:2]
+                        face_mask = np.zeros((height, width), dtype=np.uint8)
+                    else:
+                        # 如果没有找到帧，使用默认尺寸
+                        face_mask = np.zeros((480, 848), dtype=np.uint8)
+                
                 face_mask = torch.from_numpy(face_mask).unsqueeze(0).unsqueeze(0)   # (1, 1, H, W)
                 face_mask = transform(face_mask)                        # crop and resize
                 face_mask = face_mask.squeeze().cpu().numpy()           # (H, W)
@@ -128,6 +141,11 @@ class VideoProcessor:
             
                 cv2.imwrite(str(face_mask_path), face_mask)
                 logging.info(f"Face mask saved to: {face_mask_path}")
+                
+                # 检查face_emb是否为None，如果是则创建一个空的嵌入向量
+                if face_emb is None:
+                    logging.warning(f"No face embedding detected in video: {video_path.stem}, creating empty face embedding")
+                    face_emb = torch.zeros(512, dtype=torch.float32)  # 假设嵌入向量的维度是512
                 
                 torch.save(face_emb, str(face_emb_path))
                 logging.info(f"Face embedding saved to: {face_emb_path}")
