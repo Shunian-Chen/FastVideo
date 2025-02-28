@@ -229,9 +229,16 @@ class ImageProcessorForDataProcessing():
             blur_lip_mask = blur_mask(lip_mask, (64, 64), (31, 31))
 
             # 5 seperate mask
-            sep_face_mask = cv2.subtract(blur_face_mask, blur_lip_mask)
-            sep_pose_mask = 255.0 - blur_face_mask
-            sep_lip_mask = blur_lip_mask
+            if blur_face_mask is None:
+                sep_pose_mask = np.zeros((height, width), dtype=np.uint8)
+                sep_face_mask = np.zeros((height, width), dtype=np.uint8)
+                sep_lip_mask = np.zeros((height, width), dtype=np.uint8)
+            else:
+                if blur_lip_mask is None:
+                    blur_lip_mask = np.zeros_like(blur_face_mask)
+                sep_face_mask = cv2.subtract(blur_face_mask, blur_lip_mask)
+                sep_pose_mask = 255.0 - blur_face_mask
+                sep_lip_mask = blur_lip_mask
 
         return face_mask, face_emb, sep_pose_mask, sep_face_mask, sep_lip_mask
 

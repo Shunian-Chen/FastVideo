@@ -589,21 +589,25 @@ def blur_mask(mask, resize_dim=(64, 64), kernel_size=(51, 51)):
     Read, resize, blur, normalize, and save an image.
 
     Parameters:
-    file_path (str): Path to the input image file.
+    mask (np.ndarray): Input mask image.
     resize_dim (tuple): Dimensions to resize the images to.
     kernel_size (tuple): Size of the kernel to use for Gaussian blur.
+
+    Returns:
+    np.ndarray: Normalized and blurred mask, or None if the input mask is None.
     """
-    # Check if the image is loaded successfully
-    normalized_mask = None
-    if mask is not None:
-        # Resize the mask image
-        resized_mask = cv2.resize(mask, resize_dim)
-        # Apply Gaussian blur to the resized mask image
-        blurred_mask = cv2.GaussianBlur(resized_mask, kernel_size, 0)
-        # Normalize the blurred image
-        normalized_mask = cv2.normalize(
-            blurred_mask, None, 0, 255, cv2.NORM_MINMAX)
-        # Save the normalized mask image
+    # Check if the mask is None
+    if mask is None:
+        return None
+    
+    # Resize the mask image
+    resized_mask = cv2.resize(mask, resize_dim)
+    # Apply Gaussian blur to the resized mask image
+    blurred_mask = cv2.GaussianBlur(resized_mask, kernel_size, 0)
+    # Normalize the blurred image
+    normalized_mask = cv2.normalize(
+        blurred_mask, None, 0, 255, cv2.NORM_MINMAX)
+    
     return normalized_mask
 
 def get_background_mask(file_path, output_file_path):
@@ -936,28 +940,39 @@ def get_union_mask(masks):
         masks (list of np.ndarray): List of masks to be combined.
 
     Returns:
-        np.ndarray: The union of the input masks.
+        np.ndarray: The union of the input masks, or an empty mask if no valid masks are provided.
     """
+    # 检查masks列表是否为空
+    if not masks:
+        # 如果没有掩码，返回None
+        return None
+    
     union_mask = None
     for mask in masks:
+        if mask is None:
+            continue
         if union_mask is None:
             union_mask = mask
         else:
             union_mask = np.maximum(union_mask, mask)
 
-    if union_mask is not None:
-        # Find the bounding box of the non-zero regions in the mask
-        rows = np.any(union_mask, axis=1)
-        cols = np.any(union_mask, axis=0)
-        try:
-            ymin, ymax = np.where(rows)[0][[0, -1]]
-            xmin, xmax = np.where(cols)[0][[0, -1]]
-        except Exception as e:
-            print(str(e))
-            return 0.0
+    # 如果所有掩码都是None，返回None
+    if union_mask is None:
+        return None
 
-        # Set bounding box area to white
-        union_mask[ymin: ymax + 1, xmin: xmax + 1] = np.max(union_mask)
+    # Find the bounding box of the non-zero regions in the mask
+    rows = np.any(union_mask, axis=1)
+    cols = np.any(union_mask, axis=0)
+    try:
+        ymin, ymax = np.where(rows)[0][[0, -1]]
+        xmin, xmax = np.where(cols)[0][[0, -1]]
+    except Exception as e:
+        print(f"Error in get_union_mask: {str(e)}")
+        # 如果找不到边界框，返回原始掩码
+        return union_mask
+
+    # Set bounding box area to white
+    union_mask[ymin: ymax + 1, xmin: xmax + 1] = np.max(union_mask)
 
     return union_mask
 
