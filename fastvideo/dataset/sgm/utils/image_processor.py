@@ -200,76 +200,125 @@ class ImageProcessorForDataProcessing():
         # 获取图像尺寸，用于创建空掩码
         height, width = None, None
         try:
-            first_frame_path = next(Path(source_image_path).glob('*.png'), None)
-            if first_frame_path:
-                first_frame = cv2.imread(str(first_frame_path))
-                height, width = first_frame.shape[:2]
+            # 尝试找到第一个有效的图像文件
+            valid_image_found = False
+            for ext in ['.png', '.jpg', '.jpeg']:
+                if valid_image_found:
+                    break
+                for file_path in Path(source_image_path).glob(f'*{ext}'):
+                    try:
+                        # 尝试使用cv2读取图像
+                        first_frame = cv2.imread(str(file_path))
+                        if first_frame is not None and first_frame.size > 0:
+                            height, width = first_frame.shape[:2]
+                            valid_image_found = True
+                            break
+                    except Exception as e:
+                        print(f"使用cv2读取图像 {file_path} 失败: {e}")
+                        continue
+            
+            if not valid_image_found:
+                print("无法找到有效的图像文件，使用默认尺寸")
         except Exception as e:
-            print(f"Error getting image dimensions: {e}")
+            print(f"获取图像尺寸时出错: {e}")
         
         # 如果无法获取尺寸，使用默认值
         if height is None or width is None:
+            print(f"无法获取图像尺寸，使用默认值 (480, 848)")
             height, width = 480, 848
         
         if self.face_analysis:
-            for frame in sorted(os.listdir(source_image_path)):
-                try:
-                    source_image = Image.open(
-                        os.path.join(source_image_path, frame))
-                    ref_image_pil = source_image.convert("RGB")
-                    # 2.1 detect face
-                    faces = self.face_analysis.get(cv2.cvtColor(
-                        np.array(ref_image_pil.copy()), cv2.COLOR_RGB2BGR))
-                    
-                    # 检查是否检测到人脸
-                    if not faces:
+            # 尝试获取人脸嵌入向量
+            try:
+                for frame in sorted(os.listdir(source_image_path)):
+                    if not frame.lower().endswith(('.png', '.jpg', '.jpeg')):
                         continue
                         
-                    # use max size face
-                    face = sorted(faces, key=lambda x: (
-                        x["bbox"][2] - x["bbox"][0]) * (x["bbox"][3] - x["bbox"][1]))[-1]
-                    # 2.2 face embedding
-                    face_emb = face["embedding"]
-                    if face_emb is not None:
-                        break
-                except Exception as e:
-                    print(f"Error processing frame {frame}: {e}")
-                    continue
+                    try:
+                        frame_path = os.path.join(source_image_path, frame)
+                        # 尝试使用PIL打开图像
+                        try:
+                            source_image = Image.open(frame_path)
+                            ref_image_pil = source_image.convert("RGB")
+                        except Exception as e:
+                            print(f"使用PIL打开图像 {frame} 失败: {e}，跳过此帧")
+                            continue
+                            
+                        # 2.1 detect face
+                        try:
+                            faces = self.face_analysis.get(cv2.cvtColor(
+                                np.array(ref_image_pil.copy()), cv2.COLOR_RGB2BGR))
+                        except Exception as e:
+                            print(f"人脸检测失败 {frame}: {e}，跳过此帧")
+                            continue
+                        
+                        # 检查是否检测到人脸
+                        if not faces:
+                            continue
+                            
+                        # use max size face
+                        face = sorted(faces, key=lambda x: (
+                            x["bbox"][2] - x["bbox"][0]) * (x["bbox"][3] - x["bbox"][1]))[-1]
+                        # 2.2 face embedding
+                        face_emb = face["embedding"]
+                        if face_emb is not None:
+                            break
+                    except Exception as e:
+                        print(f"处理帧 {frame} 时出错: {e}，跳过此帧")
+                        continue
+            except Exception as e:
+                print(f"获取人脸嵌入向量时出错: {e}")
 
         if self.landmarker:
-            # 3.1 get landmark
-            landmarks, height, width = get_landmark_overframes(
-                self.landmarker, source_image_path)
-            
-            # 检查是否有有效的landmarks
-            has_valid_landmarks = False
-            for landmark in landmarks:
-                if landmark:  # 如果landmark不为空
-                    has_valid_landmarks = True
-                    break
-            
-            if has_valid_landmarks:
-                # 3 render face and lip mask
-                face_mask = get_union_face_mask(landmarks, height, width)
-                lip_mask = get_union_lip_mask(landmarks, height, width)
+            try:
+                # 3.1 get landmark
+                landmarks, height, width = get_landmark_overframes(
+                    self.landmarker, source_image_path)
+                
+                # 检查是否有有效的landmarks
+                has_valid_landmarks = False
+                for landmark in landmarks:
+                    if landmark:  # 如果landmark不为空
+                        has_valid_landmarks = True
+                        break
+                
+                if has_valid_landmarks:
+                    try:
+                        # 3 render face and lip mask
+                        face_mask = get_union_face_mask(landmarks, height, width)
+                        lip_mask = get_union_lip_mask(landmarks, height, width)
 
-                # 4 gaussian blur
-                blur_face_mask = blur_mask(face_mask, (64, 64), (51, 51))
-                blur_lip_mask = blur_mask(lip_mask, (64, 64), (31, 31))
+                        # 4 gaussian blur
+                        blur_face_mask = blur_mask(face_mask, (64, 64), (51, 51))
+                        blur_lip_mask = blur_mask(lip_mask, (64, 64), (31, 31))
 
-                # 5 seperate mask
-                if blur_face_mask is None:
+                        # 5 seperate mask
+                        if blur_face_mask is None:
+                            sep_pose_mask = np.zeros((height, width), dtype=np.uint8)
+                            sep_face_mask = np.zeros((height, width), dtype=np.uint8)
+                            sep_lip_mask = np.zeros((height, width), dtype=np.uint8)
+                        else:
+                            if blur_lip_mask is None:
+                                blur_lip_mask = np.zeros_like(blur_face_mask)
+                            sep_face_mask = cv2.subtract(blur_face_mask, blur_lip_mask)
+                            sep_pose_mask = 255.0 - blur_face_mask
+                            sep_lip_mask = blur_lip_mask
+                    except Exception as e:
+                        print(f"处理掩码时出错: {e}")
+                        # 创建空掩码
+                        face_mask = np.zeros((height, width), dtype=np.uint8)
+                        sep_pose_mask = np.zeros((height, width), dtype=np.uint8)
+                        sep_face_mask = np.zeros((height, width), dtype=np.uint8)
+                        sep_lip_mask = np.zeros((height, width), dtype=np.uint8)
+                else:
+                    # 如果没有有效的landmarks，创建空掩码
+                    face_mask = np.zeros((height, width), dtype=np.uint8)
                     sep_pose_mask = np.zeros((height, width), dtype=np.uint8)
                     sep_face_mask = np.zeros((height, width), dtype=np.uint8)
                     sep_lip_mask = np.zeros((height, width), dtype=np.uint8)
-                else:
-                    if blur_lip_mask is None:
-                        blur_lip_mask = np.zeros_like(blur_face_mask)
-                    sep_face_mask = cv2.subtract(blur_face_mask, blur_lip_mask)
-                    sep_pose_mask = 255.0 - blur_face_mask
-                    sep_lip_mask = blur_lip_mask
-            else:
-                # 如果没有有效的landmarks，创建空掩码
+            except Exception as e:
+                print(f"处理landmarks时出错: {e}")
+                # 创建空掩码
                 face_mask = np.zeros((height, width), dtype=np.uint8)
                 sep_pose_mask = np.zeros((height, width), dtype=np.uint8)
                 sep_face_mask = np.zeros((height, width), dtype=np.uint8)
@@ -278,6 +327,16 @@ class ImageProcessorForDataProcessing():
         # 如果face_emb仍然为None，创建一个空的嵌入向量
         if face_emb is None:
             face_emb = np.zeros(512, dtype=np.float32)  # 假设嵌入向量的维度是512
+        
+        # 确保所有返回值都不是None
+        if face_mask is None:
+            face_mask = np.zeros((height, width), dtype=np.uint8)
+        if sep_pose_mask is None:
+            sep_pose_mask = np.zeros((height, width), dtype=np.uint8)
+        if sep_face_mask is None:
+            sep_face_mask = np.zeros((height, width), dtype=np.uint8)
+        if sep_lip_mask is None:
+            sep_lip_mask = np.zeros((height, width), dtype=np.uint8)
 
         return face_mask, face_emb, sep_pose_mask, sep_face_mask, sep_lip_mask
 

@@ -380,34 +380,60 @@ def get_landmark_overframes(landmark_model, frames_path):
 
     # 获取第一帧以确定尺寸
     try:
-        first_frame = sorted(os.listdir(frames_path))[0]
-        image = mp.Image.create_from_file(os.path.join(frames_path, first_frame))
-        height, width = image.height, image.width
-    except (IndexError, FileNotFoundError) as e:
-        print(f"Error getting dimensions from first frame: {e}")
-        # 使用默认尺寸
+        first_frame_path = None
+        for file in sorted(os.listdir(frames_path)):
+            if file.endswith(('.png', '.jpg', '.jpeg')):
+                first_frame_path = os.path.join(frames_path, file)
+                break
+                
+        if first_frame_path:
+            # 尝试使用cv2读取图像
+            try:
+                first_frame = cv2.imread(first_frame_path)
+                if first_frame is not None:
+                    height, width = first_frame.shape[:2]
+                else:
+                    raise ValueError("无法读取图像")
+            except Exception as e:
+                print(f"使用cv2读取图像失败: {e}，尝试使用mediapipe读取")
+                try:
+                    image = mp.Image.create_from_file(first_frame_path)
+                    height, width = image.height, image.width
+                except Exception as e2:
+                    print(f"使用mediapipe读取图像也失败: {e2}")
+    except Exception as e:
+        print(f"获取第一帧尺寸时出错: {e}")
+    
+    # 如果无法获取尺寸，使用默认值
+    if height is None or width is None:
+        print(f"无法获取图像尺寸，使用默认值 (480, 848)")
         height, width = 480, 848
 
-    for file in sorted(os.listdir(frames_path)):
+    # 处理所有帧
+    frame_files = sorted([f for f in os.listdir(frames_path) if f.endswith(('.png', '.jpg', '.jpeg'))])
+    for file in frame_files:
         try:
-            image = mp.Image.create_from_file(os.path.join(frames_path, file))
-            if height is None or width is None:
-                height, width = image.height, image.width
-            
-            landmarker_result = landmark_model.detect(image)
-            frame_landmark = compute_face_landmarks(
-                landmarker_result, height, width)
-            face_landmarks.append(frame_landmark)
+            file_path = os.path.join(frames_path, file)
+            try:
+                image = mp.Image.create_from_file(file_path)
+                landmarker_result = landmark_model.detect(image)
+                frame_landmark = compute_face_landmarks(
+                    landmarker_result, height, width)
+                face_landmarks.append(frame_landmark)
+            except Exception as e:
+                print(f"处理帧 {file} 时出错: {e}")
+                # 添加空的landmark列表
+                face_landmarks.append([])
         except Exception as e:
-            print(f"Error processing frame {file}: {e}")
-            # 如果处理某一帧出错，添加一个空的landmark
+            print(f"处理帧 {file} 时发生未预期的错误: {e}")
+            # 添加空的landmark列表
             face_landmarks.append([])
-
-    # 确保face_landmarks的长度与帧数相同
-    if len(face_landmarks) != len(os.listdir(frames_path)):
-        print(f"Warning: Number of landmarks ({len(face_landmarks)}) does not match number of frames ({len(os.listdir(frames_path))})")
-        # 如果长度不匹配，补充空的landmark
-        while len(face_landmarks) < len(os.listdir(frames_path)):
+    
+    # 确保face_landmarks的长度与帧数相匹配
+    if len(face_landmarks) != len(frame_files):
+        print(f"警告: face_landmarks长度 ({len(face_landmarks)}) 与帧数 ({len(frame_files)}) 不匹配")
+        # 如果长度不匹配，添加空的landmark列表直到长度匹配
+        while len(face_landmarks) < len(frame_files):
             face_landmarks.append([])
 
     return face_landmarks, height, width

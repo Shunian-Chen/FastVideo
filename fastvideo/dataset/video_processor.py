@@ -97,58 +97,122 @@ class VideoProcessor:
             
             # 如果需要处理任何一种文件，则需要创建新视频
             if need_process_face or need_process_audio:
-                create_new_video(video_path, new_video_path, frame_indices)
-                logging.info(f"New video created with frames {frame_indices}: {new_video_path}")
+                try:
+                    create_new_video(video_path, new_video_path, frame_indices)
+                    logging.info(f"New video created with frames {frame_indices}: {new_video_path}")
+                except Exception as e:
+                    logging.error(f"创建新视频失败: {e}")
+                    return timestamp, None, None, None
             
             # 处理人脸相关文件
             if need_process_face:
                 images_output_dir = self.output_dir / 'images' / video_path.stem
                 images_output_dir.mkdir(parents=True, exist_ok=True)
-                images_output_dir = convert_video_to_images(
-                    new_video_path, images_output_dir)
-                logging.info(f"Images saved to: {images_output_dir}")
+                try:
+                    images_output_dir = convert_video_to_images(
+                        new_video_path, images_output_dir)
+                    logging.info(f"Images saved to: {images_output_dir}")
+                except Exception as e:
+                    logging.error(f"视频转换为图像失败: {e}")
+                    # 创建空的掩码和嵌入向量
+                    empty_mask = np.zeros((480, 848), dtype=np.uint8)
+                    cv2.imwrite(str(face_mask_path), empty_mask)
+                    empty_emb = torch.zeros(512, dtype=torch.float32)
+                    torch.save(empty_emb, str(face_emb_path))
+                    logging.warning(f"创建了空的人脸掩码和嵌入向量: {face_mask_path}, {face_emb_path}")
+                    
+                    if need_process_audio:
+                        return timestamp, face_mask_path, face_emb_path, None
+                    else:
+                        return timestamp, face_mask_path, face_emb_path, audio_emb_path
                 
                 # 计时
                 start_time_proc = time.time()
-                face_mask, face_emb, _, _, _ = self.image_processor.preprocess(
-                    images_output_dir)
-                elapsed_time = time.time() - start_time_proc
-                logging.info(f"[time] Image preprocessing completed in {elapsed_time:.2f} seconds")
+                try:
+                    face_mask, face_emb, _, _, _ = self.image_processor.preprocess(
+                        images_output_dir)
+                    elapsed_time = time.time() - start_time_proc
+                    logging.info(f"[time] Image preprocessing completed in {elapsed_time:.2f} seconds")
+                except Exception as e:
+                    logging.error(f"图像预处理失败: {e}")
+                    # 创建空的掩码和嵌入向量
+                    face_mask = None
+                    face_emb = None
                 
                 ## ------new code------
                 # 检查face_mask是否为None，如果是则创建一个空的掩码
                 if face_mask is None:
                     logging.warning(f"No face detected in video: {video_path.stem}, creating empty face mask")
                     # 获取视频的第一帧以确定尺寸
-                    first_frame_path = next(images_output_dir.glob('*.png'), None)
-                    if first_frame_path:
-                        first_frame = cv2.imread(str(first_frame_path))
-                        height, width = first_frame.shape[:2]
-                        face_mask = np.zeros((height, width), dtype=np.uint8)
-                    else:
-                        # 如果没有找到帧，使用默认尺寸
+                    try:
+                        first_frame_path = next((p for p in images_output_dir.glob('*.png') if os.path.exists(p)), None)
+                        if first_frame_path:
+                            try:
+                                first_frame = cv2.imread(str(first_frame_path))
+                                if first_frame is not None and first_frame.size > 0:
+                                    height, width = first_frame.shape[:2]
+                                    face_mask = np.zeros((height, width), dtype=np.uint8)
+                                else:
+                                    # 如果无法读取图像，使用默认尺寸
+                                    face_mask = np.zeros((480, 848), dtype=np.uint8)
+                            except Exception as e:
+                                logging.error(f"读取第一帧失败: {e}")
+                                face_mask = np.zeros((480, 848), dtype=np.uint8)
+                        else:
+                            # 如果没有找到帧，使用默认尺寸
+                            face_mask = np.zeros((480, 848), dtype=np.uint8)
+                    except Exception as e:
+                        logging.error(f"获取第一帧路径失败: {e}")
                         face_mask = np.zeros((480, 848), dtype=np.uint8)
                 
-                face_mask = torch.from_numpy(face_mask).unsqueeze(0).unsqueeze(0)   # (1, 1, H, W)
-                face_mask = transform(face_mask)                        # crop and resize
-                face_mask = face_mask.squeeze().cpu().numpy()           # (H, W)
-                face_mask = (face_mask > 0).astype(np.uint8) * 255      # 将插值产生的中间过渡值转换255
+                try:
+                    face_mask = torch.from_numpy(face_mask).unsqueeze(0).unsqueeze(0)   # (1, 1, H, W)
+                    face_mask = transform(face_mask)                        # crop and resize
+                    face_mask = face_mask.squeeze().cpu().numpy()           # (H, W)
+                    face_mask = (face_mask > 0).astype(np.uint8) * 255      # 将插值产生的中间过渡值转换255
+                except Exception as e:
+                    logging.error(f"处理face_mask失败: {e}")
+                    # 如果处理失败，创建一个默认大小的空掩码
+                    face_mask = np.zeros((224, 224), dtype=np.uint8)  # 假设transform后的大小是224x224
                 ## ------end-----------
                 
                 if images_output_dir.exists():
-                    shutil.rmtree(images_output_dir)
-                    # logging.info(f"Deleted temporary directory: {images_output_dir}")
+                    try:
+                        shutil.rmtree(images_output_dir)
+                        # logging.info(f"Deleted temporary directory: {images_output_dir}")
+                    except Exception as e:
+                        logging.warning(f"删除临时目录失败: {e}")
             
-                cv2.imwrite(str(face_mask_path), face_mask)
-                logging.info(f"Face mask saved to: {face_mask_path}")
+                try:
+                    cv2.imwrite(str(face_mask_path), face_mask)
+                    logging.info(f"Face mask saved to: {face_mask_path}")
+                except Exception as e:
+                    logging.error(f"保存人脸掩码失败: {e}")
+                    # 尝试再次创建一个空掩码并保存
+                    try:
+                        empty_mask = np.zeros((224, 224), dtype=np.uint8)
+                        cv2.imwrite(str(face_mask_path), empty_mask)
+                        logging.warning(f"创建并保存了空的人脸掩码: {face_mask_path}")
+                    except Exception as e2:
+                        logging.error(f"保存空的人脸掩码也失败: {e2}")
                 
                 # 检查face_emb是否为None，如果是则创建一个空的嵌入向量
                 if face_emb is None:
                     logging.warning(f"No face embedding detected in video: {video_path.stem}, creating empty face embedding")
                     face_emb = torch.zeros(512, dtype=torch.float32)  # 假设嵌入向量的维度是512
                 
-                torch.save(face_emb, str(face_emb_path))
-                logging.info(f"Face embedding saved to: {face_emb_path}")
+                try:
+                    torch.save(face_emb, str(face_emb_path))
+                    logging.info(f"Face embedding saved to: {face_emb_path}")
+                except Exception as e:
+                    logging.error(f"保存人脸嵌入向量失败: {e}")
+                    # 尝试再次创建一个空的嵌入向量并保存
+                    try:
+                        empty_emb = torch.zeros(512, dtype=torch.float32)
+                        torch.save(empty_emb, str(face_emb_path))
+                        logging.warning(f"创建并保存了空的人脸嵌入向量: {face_emb_path}")
+                    except Exception as e2:
+                        logging.error(f"保存空的人脸嵌入向量也失败: {e2}")
             else:
                 logging.info(f"人脸相关文件已存在，跳过处理: {face_mask_path}, {face_emb_path}")
             
@@ -171,16 +235,24 @@ class VideoProcessor:
                     if audio_output_path.exists():
                         logging.info(f"音频文件已存在，跳过提取: {audio_output_path}")
                     else:
-                        audio_output_path = extract_audio_from_videos(
-                            new_video_path, audio_output_path)
-                        logging.info(f"Audio extracted from video to: {audio_output_path}")
+                        try:
+                            audio_output_path = extract_audio_from_videos(
+                                new_video_path, audio_output_path)
+                            logging.info(f"Audio extracted from video to: {audio_output_path}")
+                        except Exception as e:
+                            logging.error(f"从视频提取音频失败: {e}")
+                            return timestamp, face_mask_path, face_emb_path, None
                 # 如果视频没有音频轨道，但存在同名音频文件，则裁切该音频文件
                 elif original_audio_path.exists():
                     logging.info(f"Video has no audio stream, but found audio file: {original_audio_path}")
                     # 裁切音频
-                    audio_output_path = trim_audio_file(
-                        original_audio_path, audio_output_path, start_time, end_time)
-                    logging.info(f"Audio trimmed and saved to: {audio_output_path}")
+                    try:
+                        audio_output_path = trim_audio_file(
+                            original_audio_path, audio_output_path, start_time, end_time)
+                        logging.info(f"Audio trimmed and saved to: {audio_output_path}")
+                    except Exception as e:
+                        logging.error(f"裁切音频失败: {e}")
+                        return timestamp, face_mask_path, face_emb_path, None
                 else:
                     logging.warning(f"Video {new_video_path} has no audio stream and no audio file found at {original_audio_path}.")
                     return timestamp, face_mask_path, face_emb_path, None
@@ -189,13 +261,17 @@ class VideoProcessor:
                 if audio_output_path.exists():
                     # 计时
                     start_time_proc = time.time()
-                    audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=24.0)
-                    # audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=fps)
-                    elapsed_time = time.time() - start_time_proc
-                    logging.info(f"[time] Audio preprocessing completed in {elapsed_time:.2f} seconds")    
-                    
-                    torch.save(audio_emb, str(audio_emb_path))
-                    logging.info(f"Audio embedding saved to: {audio_emb_path}")
+                    try:
+                        audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=24.0)
+                        # audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=fps)
+                        elapsed_time = time.time() - start_time_proc
+                        logging.info(f"[time] Audio preprocessing completed in {elapsed_time:.2f} seconds")    
+                        
+                        torch.save(audio_emb, str(audio_emb_path))
+                        logging.info(f"Audio embedding saved to: {audio_emb_path}")
+                    except Exception as e:
+                        logging.error(f"音频预处理或保存失败: {e}")
+                        return timestamp, face_mask_path, face_emb_path, None
                 else:
                     logging.warning(f"No audio file found at {audio_output_path}. Creating empty audio embedding.")
                     return timestamp, face_mask_path, face_emb_path, None
@@ -213,7 +289,8 @@ class VideoProcessor:
             return timestamp, face_mask_path, face_emb_path, audio_emb_path
         except Exception as e:
             logging.error(f"Failed to process video {video_path}: {e}")
-            raise
+            # 返回None而不是抛出异常，以便处理下一个视频
+            return datetime.now().strftime("%m-%d-%H"), None, None, None
 
 
 def create_new_video(original_video_path, new_video_path, frame_indices):
