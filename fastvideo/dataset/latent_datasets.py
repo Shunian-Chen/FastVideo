@@ -71,18 +71,60 @@ class LatentDataset(Dataset):
         return len(self.data_anno)
 
 
+# def latent_collate_function(batch):
+#     # return latent, prompt, latent_attn_mask, text_attn_mask
+#     # latent_attn_mask: # b t h w
+#     # text_attn_mask: b 1 l
+#     # needs to check if the latent/prompt' size and apply padding & attn mask
+#     latents, prompt_embeds, prompt_attention_masks = zip(*batch)
+#     # calculate max shape
+#     max_t = max([latent.shape[1] for latent in latents])
+#     max_h = max([latent.shape[2] for latent in latents])
+#     max_w = max([latent.shape[3] for latent in latents])
+
+#     # padding
+#     latents = [
+#         torch.nn.functional.pad(
+#             latent,
+#             (
+#                 0,
+#                 max_t - latent.shape[1],
+#                 0,
+#                 max_h - latent.shape[2],
+#                 0,
+#                 max_w - latent.shape[3],
+#             ),
+#         ) for latent in latents
+#     ]
+#     # attn mask
+#     latent_attn_mask = torch.ones(len(latents), max_t, max_h, max_w)
+#     # set to 0 if padding
+#     for i, latent in enumerate(latents):
+#         latent_attn_mask[i, latent.shape[1]:, :, :] = 0
+#         latent_attn_mask[i, :, latent.shape[2]:, :] = 0
+#         latent_attn_mask[i, :, :, latent.shape[3]:] = 0
+
+#     prompt_embeds = torch.stack(prompt_embeds, dim=0)
+#     prompt_attention_masks = torch.stack(prompt_attention_masks, dim=0)
+#     latents = torch.stack(latents, dim=0)
+#     return latents, prompt_embeds, latent_attn_mask, prompt_attention_masks
+
 def latent_collate_function(batch):
-    # return latent, prompt, latent_attn_mask, text_attn_mask
-    # latent_attn_mask: # b t h w
-    # text_attn_mask: b 1 l
-    # needs to check if the latent/prompt' size and apply padding & attn mask
+    # Filter out None samples (those that were skipped due to fewer than 29 valid frames)
+    batch = [item for item in batch if item is not None]
+    
+    if len(batch) == 0:
+        return None  # Or handle the case when no valid samples remain
+
+    # Extract the necessary components
     latents, prompt_embeds, prompt_attention_masks = zip(*batch)
-    # calculate max shape
+    
+    # Calculate the max shape for padding
     max_t = max([latent.shape[1] for latent in latents])
     max_h = max([latent.shape[2] for latent in latents])
     max_w = max([latent.shape[3] for latent in latents])
 
-    # padding
+    # Padding
     latents = [
         torch.nn.functional.pad(
             latent,
@@ -96,17 +138,21 @@ def latent_collate_function(batch):
             ),
         ) for latent in latents
     ]
-    # attn mask
+    
+    # Create attention masks
     latent_attn_mask = torch.ones(len(latents), max_t, max_h, max_w)
-    # set to 0 if padding
+    
+    # Set to 0 if padding
     for i, latent in enumerate(latents):
         latent_attn_mask[i, latent.shape[1]:, :, :] = 0
         latent_attn_mask[i, :, latent.shape[2]:, :] = 0
         latent_attn_mask[i, :, :, latent.shape[3]:] = 0
 
+    # Stack the tensors
     prompt_embeds = torch.stack(prompt_embeds, dim=0)
     prompt_attention_masks = torch.stack(prompt_attention_masks, dim=0)
     latents = torch.stack(latents, dim=0)
+
     return latents, prompt_embeds, latent_attn_mask, prompt_attention_masks
 
 

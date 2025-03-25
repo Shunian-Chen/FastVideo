@@ -37,6 +37,10 @@ def attention(
     out = x.reshape(b, s, -1)
     return out
 
+def shrink_head(encoder_state, dim):
+    local_heads = encoder_state.shape[dim] // nccl_info.sp_size
+    return encoder_state.narrow(
+        dim, nccl_info.rank_within_group * local_heads, local_heads)
 
 def parallel_attention(q, k, v, img_q_len, img_kv_len, text_mask = None):
     # 1GPU torch.Size([1, 11264, 24, 128]) tensor([    0, 11275, 11520], device='cuda:0', dtype=torch.int32)
@@ -50,10 +54,7 @@ def parallel_attention(q, k, v, img_q_len, img_kv_len, text_mask = None):
         key = all_to_all_4D(key, scatter_dim=2, gather_dim=1)
         value = all_to_all_4D(value, scatter_dim=2, gather_dim=1)
 
-        def shrink_head(encoder_state, dim):
-            local_heads = encoder_state.shape[dim] // nccl_info.sp_size
-            return encoder_state.narrow(
-                dim, nccl_info.rank_within_group * local_heads, local_heads)
+
 
         encoder_query = shrink_head(encoder_query, dim=2)
         encoder_key = shrink_head(encoder_key, dim=2)
@@ -98,87 +99,90 @@ def parallel_attention(q, k, v, img_q_len, img_kv_len, text_mask = None):
 
     return attn
 
-class CrossAttention(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        heads_num: int,
-        qk_norm: bool = True,
-        qk_norm_type: str = "rms",
-        attention_dropout: float = 0.1,
-        output_dropout: float = 0.1,
-        dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None,
-    ):
-        factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__()
-        
-        if hidden_size % heads_num != 0:
-            raise ValueError(
-                f"hidden_size ({hidden_size}) must be divisible by heads_num ({heads_num})"
-            )
-        
-        self.hidden_size = hidden_size
-        self.num_attention_heads = heads_num
-        self.hidden_size_per_attention_head = hidden_size // heads_num
-        
-        # Projections
-        self.query = nn.Linear(hidden_size, hidden_size, bias=True, **factory_kwargs)
-        self.key_value = nn.Linear(hidden_size, 2 * hidden_size, bias=True, **factory_kwargs)
-        self.dense = nn.Linear(hidden_size, hidden_size, bias=True, **factory_kwargs)
-        
-        # Normalization
-        qk_norm_layer = get_norm_layer(qk_norm_type)
-        norm_args = {
-            "eps": 1e-6,
-            "elementwise_affine": True,
-            **factory_kwargs
-        }
-        self.q_norm = qk_norm_layer(self.hidden_size_per_attention_head, **norm_args) if qk_norm else nn.Identity()
-        self.k_norm = qk_norm_layer(self.hidden_size_per_attention_head, **norm_args) if qk_norm else nn.Identity()
-        
-        # Dropout
-        self.attention_dropout = nn.Dropout(attention_dropout)
-        self.output_dropout = nn.Dropout(output_dropout)
-        
-        # 初始化参数
-        self._init_weights()
+def cross_attention(q, k, v, text_mask=None):
+    """
+    实现一个与 parallel_attention 输入形式相似的 cross attention。
+    
+    参数：
+      q, k, v: 各自是 (decoder_proj, encoder_proj) 形式的元组，即：
+               q = (decoder_query, encoder_query)
+               k = (decoder_key,   encoder_key)
+               v = (decoder_value, encoder_value)
+      text_mask: [batch_size, enc_seq_len] 的可选mask，用来屏蔽encoder端某些token的注意力。
 
-    def _init_weights(self):
-        nn.init.xavier_uniform_(self.query.weight)
-        nn.init.xavier_uniform_(self.key_value.weight)
-        nn.init.xavier_uniform_(self.dense.weight)
-        nn.init.zeros_(self.query.bias)
-        nn.init.zeros_(self.key_value.bias)
-        nn.init.zeros_(self.dense.bias)
+    返回：
+      cross_out: [batch_size, dec_seq_len, num_heads * head_dim]
+                 表示每个decoder token在encoder上做注意力后的输出。
+    """
+    # 解包
+    # 对于 cross attention，一般只需要 decoder_query 做 Q，encoder_key/value 做 K/V
+    decoder_query, _ = q
+    _, encoder_key = k
+    _, encoder_value = v
 
-    def _transpose_for_scores(self, tensor):
-        new_shape = tensor.size()[:-1] + (self.num_attention_heads, self.hidden_size_per_attention_head)
-        return tensor.view(new_shape).permute(0, 2, 1, 3)
+    bsz, dec_seq_len, nheads, head_dim = decoder_query.shape
+    _, enc_seq_len, _, _ = encoder_key.shape
 
-    def forward(self, hidden_states, encoder_outputs):
-        # Query projection
-        query = self._transpose_for_scores(self.query(hidden_states))
-        query = self.q_norm(query)
-        
-        # Key-Value projection
-        kv = self.key_value(encoder_outputs)
-        key, value = torch.chunk(kv, 2, dim=-1)
-        key = self._transpose_for_scores(key)
-        value = self._transpose_for_scores(value)
-        key = self.k_norm(key)
-        
-        # Scaled dot-product attention
-        scale = math.sqrt(self.hidden_size_per_attention_head)
-        context = scaled_dot_product_attention(
-            query, key, value,
-            dropout_p=self.attention_dropout.p if self.training else 0.0,
-            scale=1.0/scale
-        )
-        
-        # Output projection
-        context = context.permute(0, 2, 1, 3).contiguous()
-        context = context.view(context.size()[:-2] + (self.hidden_size,))
-        output = self.output_dropout(self.dense(context))
-        
-        return output
+    # 如果开启了 sequence parallel，需要先对 Q/K/V 做相应的 all_to_all / shrink_head
+    if get_sequence_parallel_state():
+        decoder_query = all_to_all_4D(decoder_query, scatter_dim=2, gather_dim=1)
+        # encoder_key   = all_to_all_4D(encoder_key,   scatter_dim=2, gather_dim=1)
+        # encoder_value = all_to_all_4D(encoder_value, scatter_dim=2, gather_dim=1)
+
+        # 视具体实现决定对哪些进行 shrink_head，这里假设都需要拆分
+        # decoder_query = shrink_head(decoder_query, dim=2)
+        encoder_key   = shrink_head(encoder_key,   dim=2)
+        encoder_value = shrink_head(encoder_value, dim=2)
+
+    dec_seqlen = decoder_query.shape[1]
+    enc_seqlen = encoder_key.shape[1]
+
+    # 现在，将 decoder_query 放在 sequence 的前 dec_seq_len，
+    # 将 encoder_key/value 放在后 enc_seq_len。这样可以用一次flash_attn来完成。
+    # 整体的总序列长度 = dec_seq_len + enc_seq_len
+    q_cat = torch.cat([decoder_query, torch.zeros_like(encoder_key)], dim=1)  # Q只占前 dec_seq_len
+    k_cat = torch.cat([torch.zeros_like(decoder_query), encoder_key], dim=1)  # K只占后 enc_seq_len
+    v_cat = torch.cat([torch.zeros_like(decoder_query), encoder_value], dim=1) # V只占后 enc_seq_len
+
+    
+    # qkv形状: [batch_size, dec_seq_len + enc_seq_len, 3, num_heads, head_dim]
+    qkv = torch.stack([q_cat, k_cat, v_cat], dim=2)
+
+    # 构造 attention mask，确保decoder部分的token只能看见encoder的部分
+    # text_mask 预期: [batch_size, enc_seq_len], True表示要被mask的地方
+    # 最终 attn_mask 形状也应是 [batch_size, dec_seq_len + enc_seq_len]
+    # 在其中，decoder部分不能看到 decoder 部分 => mask出前 dec_seq_len
+    # 同时，如果 text_mask 不为空，需要对 encoder 部分应用。
+    with torch.no_grad():
+        if text_mask is not None:
+            # text_mask是针对 encoder 长度的，这里要pad到 dec_seq_len + enc_seq_len
+            # decoder的前 dec_seq_len 全部 masked(因为不允许自注意)，encoder部分的mask由 text_mask决定
+            pad_decoder = torch.ones((bsz, dec_seq_len), dtype=torch.bool, device=decoder_query.device)
+            attn_mask = torch.cat([pad_decoder, text_mask], dim=1)
+        else:
+            # 如果没有传 text_mask，仍需要对decoder的前 dec_seq_len部分做mask，用True表示不允许关注
+            pad_decoder = torch.ones((bsz, dec_seq_len), dtype=torch.bool, device=decoder_query.device)
+            pad_encoder = torch.zeros((bsz, enc_seq_len), dtype=torch.bool, device=decoder_query.device)
+            attn_mask = torch.cat([pad_decoder, pad_encoder], dim=1)
+
+    # 经过flash attention后,
+    # 输出形状: [batch_size, dec_seq_len + enc_seq_len, num_heads, head_dim]
+    out = flash_attn_no_pad(qkv,
+                            attn_mask,
+                            causal=False,
+                            dropout_p=0.0,
+                            softmax_scale=None)
+
+    # cross attention只关心前 dec_seq_len 对应 Q 的部分输出
+    cross_out, _ = out.split_with_sizes([dec_seqlen, enc_seqlen], dim=1)
+
+    # 如果使用了 sequence parallel，需要还原
+    if get_sequence_parallel_state():
+        # 这里其实只需要处理 cross_out
+        cross_out = all_to_all_4D(cross_out,
+                                  scatter_dim=1,
+                                  gather_dim=2).to(decoder_query.dtype)
+
+    # 拼回 [batch_size, dec_seq_len, num_heads * head_dim]
+    cross_out = cross_out.reshape(bsz, dec_seq_len, nheads * head_dim)
+    return cross_out

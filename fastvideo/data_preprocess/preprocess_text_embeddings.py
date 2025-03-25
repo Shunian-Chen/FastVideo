@@ -38,7 +38,8 @@ class T5dataset(Dataset):
         audio_emb_path = self.train_dataset[idx]["audio_emb_path"]
         face_emb_path = self.train_dataset[idx]["face_emb_path"]
 
-        length = self.train_dataset[idx]["length"]
+        latent = torch.load(os.path.join(args.output_dir, "latent", latent_path), map_location="cpu")
+        length = latent.shape[1]
         if self.vae_debug:
             latents = torch.load(
                 os.path.join(args.output_dir, "latent",
@@ -105,7 +106,8 @@ def main(args):
     )
 
     json_data = []
-    for _, data in tqdm(enumerate(train_dataloader), disable=local_rank != 0):
+    total_batches = len(train_dataloader)
+    for _, data in tqdm(enumerate(train_dataloader), disable=local_rank != 0, total = total_batches, desc=f"[Rank {local_rank}] 处理进度", leave=True):
         with torch.inference_mode():
             with torch.autocast("cuda", dtype=autocast_type):
                 prompt_embeds, prompt_attention_mask = text_encoder.encode_prompt(
@@ -133,11 +135,11 @@ def main(args):
                         export_to_video(video[idx], video_path, fps=fps)
                     item = {}
                     item["length"] = int(data["length"][idx])
-                    item["latent_path"] = data["latent_path"][idx]
-                    item["audio_emb_path"] = data["audio_emb_path"][idx]
-                    item["face_emb_path"] = data["face_emb_path"][idx]
-                    item["prompt_embed_path"] = prompt_embed_path
-                    item["prompt_attention_mask"] = prompt_attention_mask_path
+                    item["latent_path"] = os.path.basename(data["latent_path"][idx])
+                    item["audio_emb_path"] = os.path.basename(data["audio_emb_path"][idx])
+                    item["face_emb_path"] = os.path.basename(data["face_emb_path"][idx])
+                    item["prompt_embed_path"] = os.path.basename(prompt_embed_path)
+                    item["prompt_attention_mask"] = os.path.basename(prompt_attention_mask_path)
                     item["caption"] = data["caption"][idx]
                     json_data.append(item)
     dist.barrier()

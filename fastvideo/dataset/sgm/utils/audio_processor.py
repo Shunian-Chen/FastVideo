@@ -70,7 +70,7 @@ class AudioProcessor:
         self.wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(wav2vec_model_path, local_files_only=True)
 
 
-    def preprocess(self, wav_file: str, clip_length: int=-1, fps: float=25.0):
+    def preprocess(self, wav_file: str, clip_length: int=-1, fps: float=25.0, target_length: int=121):
         """
         Preprocess a WAV audio file by separating the vocals from the background and resampling it to a 16 kHz sample rate.
         The separated vocal track is then converted into wav2vec2 for further processing or analysis.
@@ -108,11 +108,11 @@ class AudioProcessor:
 
         ## new
         try:
-            assert seq_len == 93 or seq_len == 92, "audio length is not 93"
+            assert seq_len == target_length, "audio length is not target_length"
         except Exception as e:
-            logging.error(f"audio length is not 93: {e}")
+            logging.error(f"audio length is not target_length: {e}")
             logging.error(f"audio length: {seq_len}")
-        seq_len = 93
+        seq_len = target_length
         ## end
 
         audio_feature = torch.from_numpy(audio_feature).float().to(device=self.device)

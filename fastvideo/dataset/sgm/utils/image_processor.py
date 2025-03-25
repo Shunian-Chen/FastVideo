@@ -224,6 +224,7 @@ class ImageProcessorForDataProcessing():
         
         # 如果无法获取尺寸，使用默认值
         if height is None or width is None:
+            print(f"source_image_path: {source_image_path}")
             print(f"无法获取图像尺寸，使用默认值 (480, 848)")
             height, width = 480, 848
         

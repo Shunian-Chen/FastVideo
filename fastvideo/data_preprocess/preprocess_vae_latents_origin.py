@@ -75,6 +75,34 @@ def check_all_files_exist(video_name, base_dir, output_dir):
     return all_exist, paths
 
 
+def validate_data(data):
+    """
+    验证数据，移除包含"None"值的数据项
+    
+    Args:
+        data (list): 数据列表，每项为一个字典
+        
+    Returns:
+        list: 过滤后的有效数据列表
+    """
+    valid_data = []
+    invalid_count = 0
+    for item in data:
+        valid = True
+        for key, value in item.items():
+            if value == "None":
+                logging.info(f"发现None值的键: {key}")
+                logging.info(f"无效数据项: {item}")
+                valid = False
+                invalid_count += 1
+                break
+        if valid:
+            valid_data.append(item)
+    
+    logging.info(f"数据验证完成: 共找到 {invalid_count} 个无效数据项，剩余 {len(valid_data)} 个有效数据项")
+    return valid_data
+
+
 def main(args):
     local_rank = int(os.getenv("LOCAL_RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
@@ -83,12 +111,16 @@ def main(args):
     print("*"*100)
     print("args.gpu_rank", args.gpu_rank)
     print("*"*100)
+    
+    # 设置日志级别为 WARNING，禁用 INFO 级别的日志
+    logging.getLogger().setLevel(logging.WARNING)
+    logger.setLevel(logging.WARNING)
 
     face_analysis_model_path = "./data/face_audio/face_analysis"
     landmark_model_path = "./data/face_audio/face_analysis/models/face_landmarker_v2_with_blendshapes.task"
     audio_separator_model_file = "./data/face_audio/audio_separator/Kim_Vocal_2.onnx"
     wav2vec_model_path = './data/face_audio/wav2vec/wav2vec2-base-960h'
-    output_dir = Path(f"./data/Image-Vid-Finetune-HunYuan")
+    output_dir = Path(args.output_dir)
     
     audio_processor = AudioProcessor(
         16000,
@@ -101,7 +133,8 @@ def main(args):
 
     image_processor = ImageProcessorForDataProcessing(
         face_analysis_model_path, landmark_model_path)
-    args.video_processor = VideoProcessor(output_dir,
+    args.video_processor = VideoProcessor(args,
+                                          output_dir,
                                           image_processor=image_processor,
                                           audio_processor=audio_processor)
     
@@ -169,70 +202,49 @@ def main(args):
     skipped_count = 0
     fully_skipped_count = 0
     
-    for i, data in tqdm(enumerate(train_dataloader), disable=local_rank != 0):
-        logging.info(f"[Rank {local_rank}] 处理批次 {i}")
+    # 修改tqdm的使用方式，增加总数和预估处理时间
+    total_batches = len(train_dataloader)
+    start_process_time = time.time()
+    for i, data in tqdm(
+        enumerate(train_dataloader), 
+        total=total_batches,
+        desc=f"[Rank {local_rank}] 处理进度",
+        # disable=local_rank != 0,
+        unit="batch",
+        ncols=100,
+        miniters=1,
+        position=0,
+        leave=True
+    ):
         if len(data["path"]) == 0:
             logging.info(f"[Rank {local_rank}] 空批次，跳过")
             continue
         
-        # 打印数据结构，帮助调试
-        if i == 0:
-            logging.info(f"[Rank {local_rank}] 数据结构: {', '.join(data.keys())}")
-            for key, value in data.items():
-                if isinstance(value, (list, tuple)):
-                    logging.info(f"[Rank {local_rank}] {key} 类型: {type(value)}, 长度: {len(value)}")
-                    if len(value) > 0:
-                        logging.info(f"[Rank {local_rank}] {key} 第一个元素类型: {type(value[0])}")
-                else:
-                    logging.info(f"[Rank {local_rank}] {key} 类型: {type(value)}")
-        
-        # 首先检查每个视频是否所有文件都已存在
-        videos_to_process = []
-        for idx, video_path in enumerate(data["path"]):
-            video_name = os.path.basename(video_path).split(".")[0]
-            # 获取视频所在的基础目录
-            base_dir = str(Path(video_path).parent.parent)
-            
-            # 检查所有必要的文件是否都已存在
-            all_exist, file_paths = check_all_files_exist(video_name, base_dir, args.output_dir)
-            
-            if all_exist:
-                # 如果所有文件都存在，添加到JSON数据中并跳过处理
-                logging.info(f"[Rank {local_rank}] 视频 {video_name} 的所有文件都已存在，跳过处理")
-                fully_skipped_count += 1
+        # 检查批次中是否有已处理的样本
+        batch_has_processed = False
+        for idx in range(len(data["path"])):
+            if "is_processed" in data and data["is_processed"][idx]:
+                batch_has_processed = True
+                video_path = data["path"][idx]
+                video_name = os.path.basename(video_path).split(".")[0]
                 
-                # 创建JSON条目
+                # 创建已处理样本的JSON条目
                 item = {}
-                try:
-                    # 加载已存在的潜在表示以获取其形状
-                    existing_latent = torch.load(file_paths["latent_path"], map_location="cpu")
-                    item["length"] = existing_latent.shape[1]
-                except Exception as e:
-                    logging.error(f"[Rank {local_rank}] 加载已存在的潜在表示时出错: {str(e)}")
-                    # 如果无法加载，将该视频添加到需要处理的列表中
-                    videos_to_process.append(idx)
-                    continue
-                
-                # 添加文件路径到JSON条目
-                item["latent_path"] = os.path.basename(file_paths["latent_path"])
+                item["latent_path"] = video_name + ".pt"
                 item["caption"] = data["text"][idx]
-                item["face_mask_path"] = file_paths["face_mask_path"]
-                item["face_emb_path"] = file_paths["face_emb_path"]
-                item["audio_emb_path"] = file_paths["audio_emb_path"]
+                item["face_mask_path"] = str(data["face_mask_path"][idx])
+                item["face_emb_path"] = str(data["face_emb_path"][idx])
+                item["audio_emb_path"] = str(data["audio_emb_path"][idx])
                 
                 json_data.append(item)
-            else:
-                # 如果有任何文件不存在，将该视频添加到需要处理的列表中
-                videos_to_process.append(idx)
+                fully_skipped_count += 1
+                logging.info(f"[Rank {local_rank}] 视频 {video_name} 已处理，添加到JSON数据")
         
-        # 如果没有需要处理的视频，跳过当前批次
-        if not videos_to_process:
-            logging.info(f"[Rank {local_rank}] 批次 {i} 中的所有视频都已处理，跳过批次")
+        # 如果批次中所有样本都已处理，则跳过VAE编码
+        if batch_has_processed and all("is_processed" in data and data["is_processed"][idx] for idx in range(len(data["path"]))):
+            logging.info(f"[Rank {local_rank}] 批次中所有样本都已处理，跳过VAE编码")
             continue
-        
-        # 处理需要处理的视频
-        logging.info(f"[Rank {local_rank}] 批次 {i} 中有 {len(videos_to_process)} 个视频需要处理")
-        
+
         with torch.inference_mode():
             with torch.autocast("cuda", dtype=autocast_type):
                 start_time = time.time()
@@ -241,17 +253,15 @@ def main(args):
                 elapsed_time = time.time() - start_time
                 logging.info(f"[time] {local_rank}:VAE编码和潜在采样完成，耗时 {elapsed_time:.2f} 秒")
             
-            for idx in videos_to_process:
+            for idx in range(len(data["path"])):
+                # 跳过已处理的样本
+                if "is_processed" in data and data["is_processed"][idx]:
+                    logging.info(f"[Rank {local_rank}] 样本 {idx} 已处理，跳过")
+                    continue
+                    
                 video_path = data["path"][idx]
                 logging.info(f"[Rank {local_rank}] 处理视频 {idx}: {video_path}")
                 video_name = os.path.basename(video_path).split(".")[0]
-                
-                timestamp = data.get("timestamp", "")
-                frames = int(data.get("frames", 0))
-                if isinstance(timestamp, list) and frames > 0:
-                    timestamp = "_" + str(frames) + "f_" + timestamp[0]
-                elif isinstance(timestamp, str) and timestamp != "" and frames > 0:
-                    timestamp = "_" + str(frames) + "f_" + timestamp
                 
                 latent_path = os.path.join(args.output_dir, "latent",
                                            video_name + ".pt")
@@ -265,45 +275,15 @@ def main(args):
                     logging.error(f"[Rank {local_rank}] 保存潜在表示时出错: {str(e)}")
                     continue
                 
-                # 处理视频以生成face_mask, face_emb和audio_emb
                 try:
-                    # 获取frame_indices
-                    # 优先从sample_frame_index获取，这是t2v_datasets.py中使用的键名
-                    frame_indices = data.get("sample_frame_index", None)
-                    if frame_indices is None:
-                        # 尝试从frame_indices获取
-                        frame_indices = data.get("frame_indices", [])
-                        
-                    if isinstance(frame_indices, torch.Tensor):
-                        frame_indices = frame_indices[idx].cpu().numpy().tolist()
-                    elif isinstance(frame_indices, list) and len(frame_indices) > idx:
-                        if isinstance(frame_indices[idx], torch.Tensor):
-                            frame_indices = frame_indices[idx].cpu().numpy().tolist()
-                        else:
-                            frame_indices = frame_indices[idx]
-                    
-                    # 检查frame_indices是否为空
-                    if not frame_indices:
-                        logging.error(f"[Rank {local_rank}] 视频 {video_name} 的frame_indices为空")
-                        continue
-                        
-                    logging.info(f"[Rank {local_rank}] 视频 {video_name} 的frame_indices: {frame_indices[:5]}...")
-                    
-                    # 获取transform
-                    transform = data.get("transform", None)
-                    
-                    # 调用video_processor处理视频
-                    timestamp, face_mask_path, face_emb_path, audio_emb_path = args.video_processor.process(
-                        Path(video_path), transform, frame_indices)
-                    
                     # 创建JSON条目
                     item = {}
-                    item["length"] = latents[idx].shape[1]
                     item["latent_path"] = video_name + ".pt"
+                    # item["length"] = latent.shape[1]
                     item["caption"] = data["text"][idx]
-                    item["face_mask_path"] = str(face_mask_path)
-                    item["face_emb_path"] = str(face_emb_path)
-                    item["audio_emb_path"] = str(audio_emb_path)
+                    item["face_mask_path"] = str(data["face_mask_path"][idx])
+                    item["face_emb_path"] = str(data["face_emb_path"][idx])
+                    item["audio_emb_path"] = str(data["audio_emb_path"][idx])
                     
                     json_data.append(item)
                     logging.info(f"[Rank {local_rank}] 视频 {video_name} 处理完成")
@@ -322,20 +302,11 @@ def main(args):
         logging.info(f"[Rank {local_rank}] JSON数据保存成功，共 {len(json_data)} 条记录")
     except Exception as e:
         logging.error(f"[Rank {local_rank}] 保存JSON数据时出错: {str(e)}")
-    
-    # 尝试使用barrier同步，但不要让它阻止程序继续执行
-    sync_success = True
-    if world_size > 1 and dist.is_initialized():
-        try:
-            dist.barrier()
-            logging.info(f"[Rank {local_rank}] 所有进程同步完成")
-        except Exception as e:
-            logging.error(f"[Rank {local_rank}] 同步出错: {str(e)}")
-            sync_success = False
+
     
     # 合并JSON文件
     # 如果是rank 0或者同步失败，尝试合并所有JSON文件
-    if local_rank == 0 or (not sync_success and world_size == 1):
+    if local_rank == 0:
         logging.info(f"[Rank {local_rank}] 开始合并所有进程的JSON数据")
         all_json_data = []
         
@@ -354,17 +325,46 @@ def main(args):
                 except Exception as e:
                     logging.error(f"[Rank {local_rank}] 读取进程 {rank} 的数据时出错: {str(e)}")
         
+        
+        # 根据latent_path去重
+        logging.info(f"[Rank {local_rank}] 开始根据latent_path去重")
+        unique_data = {}
+        duplicate_count = 0
+        
+        for item in all_json_data:
+            latent_path = item["latent_path"]
+            if latent_path not in unique_data:
+                unique_data[latent_path] = item
+            else:
+                duplicate_count += 1
+        
+        # 将去重后的数据转换回列表
+        all_json_data = list(unique_data.values())
+        
+        logging.info(f"[Rank {local_rank}] 去重完成，移除了 {duplicate_count} 条重复记录，剩余 {len(all_json_data)} 条记录")
+
+
         # 保存合并后的JSON文件
         if all_json_data:
             try:
+                # 验证数据
+                logging.info(f"[Rank {local_rank}] 开始验证数据")
+                all_json_data = validate_data(all_json_data)
+                
                 with open(os.path.join(args.output_dir, "videos2caption_temp.json"), "w") as f:
                     json.dump(all_json_data, f, indent=4)
-                logging.info(f"[Rank {local_rank}] 合并的JSON数据保存成功，共 {len(all_json_data)} 条记录")
+                
+                # 保存验证后的数据到最终文件
+                with open(os.path.join(args.output_dir, "videos2caption.json"), "w") as f:
+                    json.dump(all_json_data, f, indent=4, ensure_ascii=False)
+                
+                logging.info(f"[Rank {local_rank}] 验证后的JSON数据保存成功，共 {len(all_json_data)} 条记录")
             except Exception as e:
                 logging.error(f"[Rank {local_rank}] 保存合并的JSON数据时出错: {str(e)}")
         else:
             logging.error(f"[Rank {local_rank}] 没有有效的JSON数据可以合并")
 
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -394,7 +394,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_width", type=int, default=848)
     parser.add_argument("--video_length_tolerance_range",
                         type=int,
-                        default=2.0)
+                        default=5.0)
     parser.add_argument("--group_frame", action="store_true")  # TODO
     parser.add_argument("--group_resolution", action="store_true")  # TODO
     parser.add_argument("--dataset", default="t2v")

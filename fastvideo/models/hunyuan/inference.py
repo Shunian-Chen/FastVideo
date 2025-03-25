@@ -11,6 +11,7 @@ from fastvideo.models.hunyuan.constants import (NEGATIVE_PROMPT,
                                                 PRECISION_TO_TYPE,
                                                 PROMPT_TEMPLATE)
 from fastvideo.models.hunyuan.diffusion.pipelines import HunyuanVideoPipeline
+from fastvideo.models.hunyuan.diffusion.pipelines.pipeline_hunyuan_video import HunyuanVideoAudioPipeline
 from fastvideo.models.hunyuan.diffusion.schedulers import \
     FlowMatchDiscreteScheduler
 from fastvideo.models.hunyuan.modules import load_model
@@ -524,6 +525,266 @@ class HunyuanVideoSampler(Inference):
             vae_ver=self.args.vae,
             enable_tiling=self.args.vae_tiling,
             enable_vae_sp=self.args.vae_sp,
+        )[0]
+        out_dict["samples"] = samples
+        out_dict["prompts"] = prompt
+
+        gen_time = time.time() - start_time
+        logger.info(f"Success, time: {gen_time}")
+
+        return out_dict
+
+
+class HunyuanAudioVideoSampler(HunyuanVideoSampler):
+    """
+    支持音频输入的视频采样器
+    
+    继承自HunyuanVideoSampler，增加了对audio_embeds的处理支持
+    """
+    
+    def __init__(
+        self,
+        args,
+        vae,
+        vae_kwargs,
+        text_encoder,
+        model,
+        text_encoder_2=None,
+        pipeline=None,
+        use_cpu_offload=False,
+        device=0,
+        logger=None,
+        parallel_args=None,
+    ):
+        super().__init__(
+            args,
+            vae,
+            vae_kwargs,
+            text_encoder,
+            model,
+            text_encoder_2=text_encoder_2,
+            pipeline=pipeline,
+            use_cpu_offload=use_cpu_offload,
+            device=device,
+            logger=logger,
+            parallel_args=parallel_args,
+        )
+        
+    def load_diffusion_pipeline(
+        self,
+        args,
+        vae,
+        text_encoder,
+        text_encoder_2,
+        model,
+        scheduler=None,
+        device=None,
+        progress_bar_config=None,
+        data_type="video",
+    ):
+        """加载音频条件视频生成的推理pipeline"""
+        if scheduler is None:
+            if args.denoise_type == "flow":
+                scheduler = FlowMatchDiscreteScheduler(
+                    shift=args.flow_shift,
+                    reverse=args.flow_reverse,
+                    solver=args.flow_solver,
+                )
+            else:
+                raise ValueError(f"Invalid denoise type {args.denoise_type}")
+
+        # 注意这里使用HunyuanVideoAudioPipeline替代了HunyuanVideoPipeline
+        pipeline = HunyuanVideoAudioPipeline(
+            vae=vae,
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
+            transformer=model,
+            scheduler=scheduler,
+            progress_bar_config=progress_bar_config,
+            args=args,
+        )
+        if self.use_cpu_offload:
+            pipeline.enable_sequential_cpu_offload()
+        else:
+            pipeline = pipeline.to(device)
+
+        return pipeline
+
+    @torch.no_grad()
+    def predict(
+        self,
+        prompt,
+        height=192,
+        width=336,
+        video_length=129,
+        seed=None,
+        negative_prompt=None,
+        infer_steps=50,
+        guidance_scale=6,
+        flow_shift=5.0,
+        embedded_guidance_scale=None,
+        batch_size=1,
+        num_videos_per_prompt=1,
+        audio_embeds=None,  # 新增：音频嵌入
+        face_embeds=None,   # 新增：人脸嵌入（可选）
+        **kwargs,
+    ):
+        """
+        从给定的文本和音频输入预测视频。
+        
+        Args:
+            prompt (str or List[str]): 输入文本提示。
+            audio_embeds (torch.Tensor): 音频嵌入张量。
+            kwargs:
+                height (int): 输出视频的高度。默认为192。
+                width (int): 输出视频的宽度。默认为336。
+                video_length (int): 输出视频的帧数。默认为129。
+                seed (int or List[str]): 生成的随机种子。默认为随机整数。
+                negative_prompt (str or List[str]): 负面文本提示。默认为空字符串。
+                guidance_scale (float): 生成的引导比例。默认为6.0。
+                num_videos_per_prompt (int): 每个提示的视频数量。默认为1。
+                infer_steps (int): 推理步骤的数量。默认为50。
+                face_embeds (torch.Tensor): 人脸嵌入张量（可选）。
+        """
+        
+        # 基本参数处理与父类相同
+        out_dict = dict()
+
+        # 处理种子
+        if isinstance(seed, torch.Tensor):
+            seed = seed.tolist()
+        if seed is None:
+            seeds = [
+                random.randint(0, 1_000_000)
+                for _ in range(batch_size * num_videos_per_prompt)
+            ]
+        elif isinstance(seed, int):
+            seeds = [
+                seed + i for _ in range(batch_size)
+                for i in range(num_videos_per_prompt)
+            ]
+        elif isinstance(seed, (list, tuple)):
+            if len(seed) == batch_size:
+                seeds = [
+                    int(seed[i]) + j for i in range(batch_size)
+                    for j in range(num_videos_per_prompt)
+                ]
+            elif len(seed) == batch_size * num_videos_per_prompt:
+                seeds = [int(s) for s in seed]
+            else:
+                raise ValueError(
+                    f"Length of seed must be equal to number of prompt(batch_size) or "
+                    f"batch_size * num_videos_per_prompt ({batch_size} * {num_videos_per_prompt}), got {seed}."
+                )
+        else:
+            raise ValueError(
+                f"Seed must be an integer, a list of integers, or None, got {seed}."
+            )
+        generator = [
+            torch.Generator("cpu").manual_seed(seed) for seed in seeds
+        ]
+        out_dict["seeds"] = seeds
+
+        # 验证并调整视频尺寸
+        if width <= 0 or height <= 0 or video_length <= 0:
+            raise ValueError(
+                f"`height` and `width` and `video_length` must be positive integers, got height={height}, width={width}, video_length={video_length}"
+            )
+        if (video_length - 1) % 4 != 0:
+            raise ValueError(
+                f"`video_length-1` must be a multiple of 4, got {video_length}"
+            )
+
+        logger.info(
+            f"Input (height, width, video_length) = ({height}, {width}, {video_length})"
+        )
+
+        target_height = align_to(height, 16)
+        target_width = align_to(width, 16)
+        target_video_length = video_length
+
+        out_dict["size"] = (target_height, target_width, target_video_length)
+
+        # 处理提示词
+        if not isinstance(prompt, str):
+            raise TypeError(
+                f"`prompt` must be a string, but got {type(prompt)}")
+        prompt = [prompt.strip()]
+
+        # 负面提示词
+        if negative_prompt is None or negative_prompt == "":
+            negative_prompt = self.default_negative_prompt
+        if not isinstance(negative_prompt, str):
+            raise TypeError(
+                f"`negative_prompt` must be a string, but got {type(negative_prompt)}"
+            )
+        negative_prompt = [negative_prompt.strip()]
+
+        # 设置调度器
+        scheduler = FlowMatchDiscreteScheduler(
+            shift=flow_shift,
+            reverse=self.args.flow_reverse,
+            solver=self.args.flow_solver,
+        )
+        self.pipeline.scheduler = scheduler
+
+        if "884" in self.args.vae:
+            latents_size = [(video_length - 1) // 4 + 1, height // 8,
+                            width // 8]
+        elif "888" in self.args.vae:
+            latents_size = [(video_length - 1) // 8 + 1, height // 8,
+                            width // 8]
+        n_tokens = latents_size[0] * latents_size[1] * latents_size[2]
+
+        # 打印推理参数
+        debug_str = f"""
+                        height: {target_height}
+                         width: {target_width}
+                  video_length: {target_video_length}
+                        prompt: {prompt}
+                    neg_prompt: {negative_prompt}
+                          seed: {seed}
+                   infer_steps: {infer_steps}
+         num_videos_per_prompt: {num_videos_per_prompt}
+                guidance_scale: {guidance_scale}
+                      n_tokens: {n_tokens}
+                    flow_shift: {flow_shift}
+       embedded_guidance_scale: {embedded_guidance_scale}
+               audio_embeds: {"有" if audio_embeds is not None else "无"}
+                face_embeds: {"有" if face_embeds is not None else "无"}"""
+        logger.debug(debug_str)
+
+        # 验证音频嵌入
+        if audio_embeds is not None:
+            logger.info(f"音频嵌入形状: {audio_embeds.shape}")
+            # 确保音频嵌入与视频长度兼容
+            if hasattr(audio_embeds, "shape") and len(audio_embeds.shape) >= 2:
+                audio_frames = audio_embeds.shape[1]  # 假设形状为[batch, frames, ...]
+                if audio_frames != target_video_length:
+                    logger.warning(f"音频帧数({audio_frames})与目标视频帧数({target_video_length})不匹配")
+
+        # Pipeline推理
+        start_time = time.time()
+        samples = self.pipeline(
+            prompt=prompt,
+            height=target_height,
+            width=target_width,
+            video_length=target_video_length,
+            num_inference_steps=infer_steps,
+            guidance_scale=guidance_scale,
+            negative_prompt=negative_prompt,
+            num_videos_per_prompt=num_videos_per_prompt,
+            generator=generator,
+            output_type="pil",
+            n_tokens=n_tokens,
+            embedded_guidance_scale=embedded_guidance_scale,
+            data_type="video" if target_video_length > 1 else "image",
+            is_progress_bar=True,
+            vae_ver=self.args.vae,
+            enable_tiling=self.args.vae_tiling,
+            enable_vae_sp=self.args.vae_sp,
+            audio_embeds=audio_embeds,  # 传递音频嵌入
+            face_embeds=face_embeds,    # 传递人脸嵌入
         )[0]
         out_dict["samples"] = samples
         out_dict["prompts"] = prompt

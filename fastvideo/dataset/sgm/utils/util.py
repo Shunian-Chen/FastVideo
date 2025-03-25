@@ -390,7 +390,7 @@ def get_landmark_overframes(landmark_model, frames_path):
             # 尝试使用cv2读取图像
             try:
                 first_frame = cv2.imread(first_frame_path)
-                if first_frame is not None:
+                if first_frame is not None and first_frame.size > 0:
                     height, width = first_frame.shape[:2]
                 else:
                     raise ValueError("无法读取图像")
@@ -401,40 +401,44 @@ def get_landmark_overframes(landmark_model, frames_path):
                     height, width = image.height, image.width
                 except Exception as e2:
                     print(f"使用mediapipe读取图像也失败: {e2}")
+                    print(f"source_image_path: {frames_path}")
+                    print(f"无法获取图像尺寸，使用默认值 (720, 1280)")
+                    height, width = 720, 1280  # 使用默认值
+        else:
+            print(f"无法找到有效的图像文件，使用默认尺寸")
+            print(f"source_image_path: {frames_path}")
+            height, width = 720, 1280  # 使用默认值
     except Exception as e:
-        print(f"获取第一帧尺寸时出错: {e}")
-    
-    # 如果无法获取尺寸，使用默认值
-    if height is None or width is None:
-        print(f"无法获取图像尺寸，使用默认值 (480, 848)")
-        height, width = 480, 848
+        print(f"获取图像尺寸时出错: {e}")
+        height, width = 720, 1280  # 使用默认值
 
     # 处理所有帧
-    frame_files = sorted([f for f in os.listdir(frames_path) if f.endswith(('.png', '.jpg', '.jpeg'))])
-    for file in frame_files:
-        try:
+    try:
+        for file in sorted(os.listdir(frames_path)):
+            if not file.endswith(('.png', '.jpg', '.jpeg')):
+                continue
+                
             file_path = os.path.join(frames_path, file)
+            
+            # 尝试使用mediapipe处理图像
             try:
                 image = mp.Image.create_from_file(file_path)
-                landmarker_result = landmark_model.detect(image)
-                frame_landmark = compute_face_landmarks(
-                    landmarker_result, height, width)
-                face_landmarks.append(frame_landmark)
+                detection_result = landmark_model.detect(image)
+                
+                if detection_result.face_landmarks:
+                    landmarks = compute_face_landmarks(detection_result, height, width)
+                    face_landmarks.append(landmarks)
+                else:
+                    # 如果没有检测到人脸，添加空列表
+                    face_landmarks.append([])
             except Exception as e:
-                print(f"处理帧 {file} 时出错: {e}")
-                # 添加空的landmark列表
+                print(f"处理图像 {file_path} 失败: {e}")
+                # 添加空列表表示这一帧处理失败
                 face_landmarks.append([])
-        except Exception as e:
-            print(f"处理帧 {file} 时发生未预期的错误: {e}")
-            # 添加空的landmark列表
-            face_landmarks.append([])
-    
-    # 确保face_landmarks的长度与帧数相匹配
-    if len(face_landmarks) != len(frame_files):
-        print(f"警告: face_landmarks长度 ({len(face_landmarks)}) 与帧数 ({len(frame_files)}) 不匹配")
-        # 如果长度不匹配，添加空的landmark列表直到长度匹配
-        while len(face_landmarks) < len(frame_files):
-            face_landmarks.append([])
+    except Exception as e:
+        print(f"处理图像帧时出错: {e}")
+        # 如果完全失败，返回空列表
+        return [], height, width
 
     return face_landmarks, height, width
 
@@ -963,17 +967,37 @@ def convert_video_to_images(video_path: Path, output_dir: Path) -> Path:
     Raises:
         subprocess.CalledProcessError: If the ffmpeg command fails to execute.
     """
+    # 使用JPEG格式而不是PNG，JPEG更稳定且文件更小
     ffmpeg_command = [
         'ffmpeg', '-v', 'error', 
         '-i', str(video_path),
         '-vf', 'fps=25',
-        str(output_dir / '%04d.png')
+        '-q:v', '2',  # 高质量JPEG
+        str(output_dir / '%04d.jpg')  # 使用jpg而不是png
     ]
 
     try:
         # print(f"Running command: {' '.join(ffmpeg_command)}")
-        subprocess.run(ffmpeg_command, check=True)
-    except subprocess.CalledProcessError as e:
+        subprocess.run(ffmpeg_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # 检查是否成功生成了图像文件
+        image_files = list(output_dir.glob('*.jpg'))
+        if not image_files:
+            print(f"警告：未能生成任何图像文件，尝试使用备用方法")
+            # 备用方法：使用OpenCV直接读取视频帧
+            cap = cv2.VideoCapture(str(video_path))
+            frame_count = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_count += 1
+                cv2.imwrite(str(output_dir / f'{frame_count:04d}.jpg'), frame)
+            cap.release()
+            
+            if frame_count == 0:
+                raise Exception("无法使用OpenCV提取视频帧")
+    except Exception as e:
         print(f"Error converting video to images: {e}")
         raise
 

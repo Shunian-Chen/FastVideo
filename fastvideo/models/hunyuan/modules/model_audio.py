@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import math
+import torch.nn.init as init
 from torch.nn.functional import scaled_dot_product_attention
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models import ModelMixin
@@ -13,7 +14,7 @@ from fastvideo.models.hunyuan.modules.posemb_layers import \
 from fastvideo.utils.parallel_states import nccl_info
 
 from .activation_layers import get_activation_layer
-from .attenion import parallel_attention, CrossAttention
+from .attenion import parallel_attention, cross_attention
 from .embed_layers import PatchEmbed, TextProjection, TimestepEmbedder, FaceProjModel, AudioProjModel
 from .mlp_layers import MLP, FinalLayer, MLPEmbedder
 from .modulate_layers import ModulateDiT, apply_gate, modulate
@@ -138,7 +139,14 @@ class MMDoubleStreamBlockAudio(nn.Module):
         
 
         # 添加audio的cross attention模块
+        self.audio_scale = nn.Parameter(torch.ones(1))
+        self.audio_norm = nn.LayerNorm(hidden_size,
+                                      elementwise_affine=False,
+                                      eps=1e-6,
+                                      **factory_kwargs)
         self.audio_attn_qkv = nn.Linear(hidden_size, hidden_size * 3, bias=qkv_bias, **factory_kwargs)
+        init.xavier_uniform_(self.audio_attn_qkv.weight)
+        init.zeros_(self.audio_attn_qkv.bias)
         self.audio_attn_q_norm = (qk_norm_layer(
             head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs)
                                 if qk_norm else nn.Identity())
@@ -252,55 +260,23 @@ class MMDoubleStreamBlockAudio(nn.Module):
         img = img + apply_gate(self.img_attn_proj(img_attn),
                                gate=img_mod1_gate)
 
-        # 添加audio cross attention
-
-
-        # # 添加face cross attention
-        # if face_emb is not None:
-        #     face_attn_input = self.face_input_layernorm(img)
-        #     print(f"="*80)
-        #     print(f"face cross attention, face_attn_input shape: {face_attn_input.shape}")
-        #     print(f"face cross attention, face_emb shape: {face_emb.shape}")
-        #     print(f"="*80)
-        #     face_attn_output = self.face_attn(face_attn_input, face_emb)
-        #     img = img + face_attn_output
-        # print(f"face cross attention done")
-        # print(f"="*80)
-        # print(f"audio cross attention")
-        # print(f"="*80)
-        # # 添加audio cross attention
-        # if audio_emb is not None:
-        #     audio_attn_input = self.audio_input_layernorm(img)
-        #     print(f"="*80)
-        #     print(f"audio cross attention, audio_attn_input shape: {audio_attn_input.shape}")
-        #     print(f"audio cross attention, audio_emb shape: {audio_emb.shape}")
-        #     print(f"="*80)
-        #     audio_attn_output = self.audio_attn(audio_attn_input, audio_emb)
-        #     img = img + audio_attn_output
-        # print(f"audio cross attention done")
-        # print(f"="*80)
-        # print(f"audio_emb: {audio_emb.shape}")
+        audio_emb = self.audio_norm(audio_emb)
         aud_qkv = self.audio_attn_qkv(audio_emb)
         aud_q, aud_k, aud_v = rearrange(aud_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
         aud_q = self.audio_attn_q_norm(aud_q).to(aud_v)
         aud_k = self.audio_attn_k_norm(aud_k).to(aud_v)
         # audio mask
         audio_mask = torch.ones_like(aud_q[:, :, 1, 1])
-        # print(f"audio_mask: {audio_mask.shape}")
-        # print(f"audio emb: {audio_emb.shape}")
-        # print(f"img_v: {img_v.shape}")
-        # print(f"aud_q: {aud_q.shape}")
-        aud_attn = parallel_attention(
+        aud_out = cross_attention(
             (img_q, aud_q),
             (img_k, aud_k),
             (img_v, aud_v),
-            img_q_len=img_q.shape[1],
-            img_kv_len=img_k.shape[1],
             text_mask=audio_mask,
         )
-        img_attn = aud_attn[:, :img.shape[1]]
-        # img = img + apply_gate(img_attn, gate=img_mod1_gate)
 
+        max_value = 2
+        scale = torch.clamp(self.audio_scale, max=max_value)
+        img = img + aud_out * scale
 
         img = img + apply_gate(
             self.img_mlp(
@@ -384,27 +360,7 @@ class MMSingleStreamBlockAudio(nn.Module):
         )
         self.hybrid_seq_parallel_attn = None
 
-        # 添加face和audio的cross attention
 
-
-        # # 添加face和audio的cross attention
-        # self.face_input_layernorm = nn.LayerNorm(hidden_size, eps=1e-6, **factory_kwargs)
-        # self.face_attn = CrossAttention(
-        #     hidden_size,
-        #     heads_num,
-        #     qk_norm=qk_norm,
-        #     qk_norm_type=qk_norm_type,
-        #     **factory_kwargs
-        # )
-        
-        # self.audio_input_layernorm = nn.LayerNorm(hidden_size, eps=1e-6, **factory_kwargs)
-        # self.audio_attn = CrossAttention(
-        #     hidden_size,
-        #     heads_num,
-        #     qk_norm=qk_norm,
-        #     qk_norm_type=qk_norm_type,
-        #     **factory_kwargs
-        # )
         # # 添加face的cross attention模块
         # self.face_attn_qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True, **factory_kwargs)
         # self.face_attn_q_norm = (qk_norm_layer(
@@ -416,7 +372,15 @@ class MMSingleStreamBlockAudio(nn.Module):
         
 
         # 添加audio的cross attention模块
+        self.audio_scale = nn.Parameter(torch.ones(1))
+        self.audio_norm = nn.LayerNorm(hidden_size,
+                                      elementwise_affine=False,
+                                      eps=1e-6,
+                                      **factory_kwargs)
         self.audio_attn_qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True, **factory_kwargs)
+        # print(f"qkv.shape: {self.audio_attn_qkv.weight.shape}")
+        init.xavier_uniform_(self.audio_attn_qkv.weight)
+        init.zeros_(self.audio_attn_qkv.bias)
         self.audio_attn_q_norm = (qk_norm_layer(
             head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs)
                                 if qk_norm else nn.Identity())
@@ -475,6 +439,7 @@ class MMSingleStreamBlockAudio(nn.Module):
         ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
         img_q, img_k = img_qq, img_kk
 
+        # print(f"img_q shape: {img_q.shape}, txt_q shape: {txt_q.shape}, img_k shape: {img_k.shape}, txt_k shape: {txt_k.shape}")
         attn = parallel_attention(
             (img_q, txt_q),
             (img_k, txt_k),
@@ -484,33 +449,48 @@ class MMSingleStreamBlockAudio(nn.Module):
             text_mask=text_mask,
         )
 
-        # attention computation end
+        img_attn, txt_attn = attn[:, :img_q.shape[1]], attn[:, img_q.shape[1]:]
+
+        # print(f"img_attn shape: {img_attn.shape}, txt_attn shape: {txt_attn.shape}")
+
+        # audio cross attention
+        # print(f"audio_emb shape: {audio_emb.shape}")
+        audio_emb = self.audio_norm(audio_emb)
+        # print(f"audio_emb shape after norm: {audio_emb.shape}")
+        aud_qkv = self.audio_attn_qkv(audio_emb)
+        # print(f"aud_qkv shape: {aud_qkv.shape}")
+        aud_q, aud_k, aud_v = rearrange(aud_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
+        # print(f"aud_q shape: {aud_q.shape}, aud_k shape: {aud_k.shape}, aud_v shape: {aud_v.shape}")
+        aud_q = self.audio_attn_q_norm(aud_q).to(aud_v)
+        aud_k = self.audio_attn_k_norm(aud_k).to(aud_v)
+        audio_mask = torch.ones_like(aud_q[:, :, 1, 1])
+        
+        aud_out = cross_attention(
+            (img_q, aud_q),
+            (img_k, aud_k),
+            (img_v, aud_v),
+            text_mask=audio_mask,
+        )
+
+        # print(f"aud_out shape: {aud_out.shape}")
+        max_value = 2
+        scale = torch.clamp(self.audio_scale, max=max_value)
+        img_attn = img_attn + aud_out * scale
+
+        # print(f"img_attn shape: {img_attn.shape}, txt_attn shape: {txt_attn.shape}")
+
+        attn = torch.cat((img_attn, txt_attn), dim=1)
+
+        # print(f"attn shape: {attn.shape}")
 
         # Compute activation in mlp stream, cat again and run second linear layer.
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        output = x + apply_gate(output, gate=mod_gate)
+
+        # attention computation end
+
         
 
-        # 获取视频长度
-        # img_seq_len = output.shape[1] - txt_len
-        # video_length = img_seq_len // (self.patch_size[0] * self.patch_size[1] * self.patch_size[2])
-        
-        # # face cross attention
-        # if face_emb is not None:
-        #     face_attn_input = self.face_input_layernorm(output[:, txt_len:])
-        #     face_attn_input = rearrange(face_attn_input, "b (t n) d -> (b t) n d", t=video_length)
-        #     face_attn_output = self.face_attn(face_attn_input, face_emb)
-        #     face_attn_output = rearrange(face_attn_output, "(b t) n d -> b (t n) d", t=video_length)
-        #     output = torch.cat([output[:, :txt_len], output[:, txt_len:] + face_attn_output], dim=1)
-        
-        # # audio cross attention
-        # if audio_emb is not None:
-        #     audio_attn_input = self.audio_input_layernorm(output[:, txt_len:])
-        #     audio_attn_input = rearrange(audio_attn_input, "b (t n) d -> (b t) n d", t=video_length)
-        #     audio_attn_output = self.audio_attn(audio_attn_input, audio_emb)
-        #     audio_attn_output = rearrange(audio_attn_output, "(b t) n d -> b (t n) d", t=video_length)
-        #     output = torch.cat([output[:, :txt_len], output[:, txt_len:] + audio_attn_output], dim=1)
-            
-        output = x + apply_gate(output, gate=mod_gate)
         return output
 
 
@@ -758,21 +738,15 @@ class HYVideoDiffusionTransformerAudio(ModelMixin, ConfigMixin):
         
         frame_num = hidden_states.shape[2]
         # print(f"frame_num: {frame_num}")
-        # print(f"hidden_states shape: {hidden_states.shape}")
+        print(f"hidden_states shape: {hidden_states.shape}")
 
         # 处理audio_emb和face_emb,参考BaseTransformer的处理方式
         if audio_emb is not None:
-            # logger.info(f"audio_emb shape before proj: {audio_emb.shape}")
-            # print("="*80)
-            # print(f"audio_emb shape before proj: {audio_emb.shape}")
-            # print("="*80)
+
             print(f"audio_emb shape before proj: {audio_emb.shape}")
             audio_emb = self.audio_proj(audio_emb)
             print(f"audio_emb shape after proj: {audio_emb.shape}")
             _, f, _ = audio_emb.shape
-            # print("="*80)
-            # print(f"audio_emb shape after proj: {audio_emb.shape}")
-            # print("="*80)
             assert f==frame_num, print(f"audio_emb frame_num: {f}, hidden_states frame_num: {frame_num}")
             # audio_emb = rearrange(audio_emb, "b f m c -> (b f) m c")
             # logger.info(f"audio_emb shape after rearrange: {audio_emb.shape}")
@@ -842,25 +816,10 @@ class HYVideoDiffusionTransformerAudio(ModelMixin, ConfigMixin):
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
         # --------------------- Pass through DiT blocks ------------------------
         # 修改double blocks的参数传递,添加audio_emb和face_emb
-        logger.info(f"="*80)
-        logger.info(f"double blocks inference")
-        logger.info(f"="*80)
         for _, block in enumerate(self.double_blocks):
             double_block_args = [img, txt, vec, freqs_cis, text_mask, audio_emb, face_emb]
-            # print("="*80)
-            # print(f"img shape: {img.shape}")
-            # print(f"txt shape: {txt.shape}")
-            # print(f"vec shape: {vec.shape}")
-            # # print(f"freqs_cis shape: {freqs_cis.shape}")
-            # # print(f"text_mask shape: {text_mask.shape}")
-            # print(f"audio_emb shape: {audio_emb.shape}")
-            # print(f"face_emb shape: {face_emb.shape}")
-            # print("="*80)
-            
             img, txt = block(*double_block_args)
-        logger.info(f"="*80)
-        logger.info(f"double blocks inference done")
-        logger.info(f"="*80)
+
 
         # Merge txt and img to pass through single stream blocks.
         # 修改single blocks的参数传递

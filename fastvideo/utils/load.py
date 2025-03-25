@@ -250,13 +250,41 @@ def load_hunyuan_state_dict(model, dit_model_name_or_path):
     return model
 
 def load_hunyuan_audio_state_dict(model, dit_model_name_or_path):
+    """
+    加载HunyuanAudio模型权重
+    
+    当dit_model_name_or_path为None时，将返回原始模型，不加载权重
+    当dit_model_name_or_path为路径时，从指定路径加载权重
+    支持.pt和.safetensors格式的模型权重文件
+    """
+    # 如果权重路径为None，直接返回初始化模型
+    if dit_model_name_or_path is None:
+        main_print("警告：未提供权重路径 (dit_model_name_or_path)，模型将使用随机权重初始化。")
+        return model
+    
     load_key = "module"
     model_path = dit_model_name_or_path
     bare_model = "unknown"
 
-    state_dict = torch.load(model_path,
-                            map_location=lambda storage, loc: storage,
-                            weights_only=True)
+    main_print(f"正在从 {model_path} 加载模型...")
+    
+    # 根据文件扩展名选择正确的加载方法
+    if str(model_path).endswith('.safetensors'):
+        try:
+            from safetensors.torch import load_file
+            main_print(f"使用safetensors加载模型: {model_path}")
+            state_dict = load_file(model_path)
+        except ImportError:
+            main_print("警告：未安装safetensors库，尝试使用torch.load加载")
+            state_dict = torch.load(model_path,
+                                   map_location=lambda storage, loc: storage,
+                                   weights_only=True)
+    else:
+        # 对于.pt文件使用torch.load
+        main_print(f"使用torch.load加载模型: {model_path}")
+        state_dict = torch.load(model_path,
+                               map_location=lambda storage, loc: storage,
+                               weights_only=True)
 
     if bare_model == "unknown" and ("ema" in state_dict
                                     or "module" in state_dict):
@@ -265,10 +293,29 @@ def load_hunyuan_audio_state_dict(model, dit_model_name_or_path):
         if load_key in state_dict:
             state_dict = state_dict[load_key]
         else:
-            raise KeyError(
-                f"Missing key: `{load_key}` in the checkpoint: {model_path}. The keys in the checkpoint "
-                f"are: {list(state_dict.keys())}.")
-    model.load_state_dict(state_dict, strict=False)
+            # 检查是否是直接的模型状态字典（没有module键）
+            main_print(f"模型文件中没有'{load_key}'键，尝试直接加载状态字典。")
+            # 打印状态字典中的前几个键，帮助调试
+            main_print(f"状态字典包含的键: {list(state_dict.keys())[:5]}...")
+    
+    # 加载模型权重
+    try:
+        model.load_state_dict(state_dict, strict=False)
+        main_print("模型加载成功！")
+    except Exception as e:
+        main_print(f"模型加载时出错: {e}")
+        # 尝试进行键名称修复
+        main_print("尝试修复键名称不匹配问题...")
+        fixed_state_dict = {}
+        for k, v in state_dict.items():
+            # 移除可能的前缀（如果有的话）
+            if k.startswith('transformer.'):
+                fixed_state_dict[k[12:]] = v
+            else:
+                fixed_state_dict[k] = v
+        model.load_state_dict(fixed_state_dict, strict=False)
+        main_print("使用修复的状态字典加载模型成功！")
+    
     return model
 
 def load_transformer(
@@ -348,7 +395,7 @@ def load_vae(model_type, pretrained_model_name_or_path):
             torch_dtype=weight_dtype)
         autocast_type = torch.bfloat16
         fps = 24
-    elif model_type == "hunyuan":
+    elif model_type == "hunyuan" or model_type == "hunyuan_audio":
         vae_precision = torch.float32
         vae_path = os.path.join(pretrained_model_name_or_path,
                                 "hunyuan-video-t2v-720p/vae")

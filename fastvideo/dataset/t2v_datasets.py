@@ -2,8 +2,10 @@ import json
 import math
 import os
 import random
+import logging
 from collections import Counter
 from os.path import join as opj
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -15,6 +17,9 @@ from torch.utils.data import Dataset
 from fastvideo.utils.dataset_utils import DecordInit
 from fastvideo.utils.logging_ import main_print
 
+# 配置日志记录
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
 class SingletonMeta(type):
     _instances = {}
@@ -35,6 +40,7 @@ class DataSetProg(metaclass=SingletonMeta):
         self.n_elements = 0
         self.worker_elements = dict()
         self.n_used_elements = dict()
+        self.processed_samples = []  # 新增：存储已处理的样本信息
 
     def set_cap_list(self, num_workers, cap_list, n_elements):
         self.num_workers = num_workers
@@ -95,6 +101,7 @@ class T2V_dataset(Dataset):
         self.tokenizer = tokenizer
         self.text_max_length = args.text_max_length
         self.cfg = args.cfg
+        self.output_dir = args.output_dir
         self.speed_factor = args.speed_factor
         self.max_height = args.max_height
         self.max_width = args.max_width
@@ -122,6 +129,25 @@ class T2V_dataset(Dataset):
     def get_video_v2(self, idx, json_file="frame_indices_shunian.json"):
         video_path = dataset_prog.cap_list[idx]["path"]
         assert os.path.exists(video_path), f"file {video_path} do not exist!"
+        
+        # 检查样本是否已处理
+        if dataset_prog.cap_list[idx].get("is_processed", False):
+            logging.info(f"[Rank {self.gpu_rank}] 样本 {video_path} 已处理，跳过处理")
+            # 返回一个特殊标记，表示该样本已处理
+            return dict(
+                pixel_values=torch.tensor([]),
+                text=dataset_prog.cap_list[idx]["cap"],
+                input_ids=torch.tensor([]),
+                cond_mask=torch.tensor([]),
+                path=video_path,
+                timestamp=torch.tensor([-1]),  # 使用-1表示已处理
+                frames=torch.tensor([]),
+                face_mask_path=dataset_prog.cap_list[idx].get("face_mask_path", ""),
+                face_emb_path=dataset_prog.cap_list[idx].get("face_emb_path", ""),
+                audio_emb_path=dataset_prog.cap_list[idx].get("audio_emb_path", ""),
+                is_processed=True  # 添加标记
+            )
+        
         frame_indices = dataset_prog.cap_list[idx]["sample_frame_index"]
         try:
             assert len(frame_indices) == self.num_frames, f"frame_indices length is not equal to self.num_frames"
@@ -427,7 +453,7 @@ class T2V_dataset(Dataset):
         print(folder_anno)
         for folder, anno in folder_anno:
             with open(anno, "r") as f:
-                sub_list = json.load(f)[:10]
+                sub_list = json.load(f)
             for i in range(len(sub_list)):
                 sub_list[i]["path"] = opj(folder, sub_list[i]["path"])
             cap_lists += sub_list
@@ -435,4 +461,81 @@ class T2V_dataset(Dataset):
 
     def get_cap_list(self):
         cap_lists = self.read_jsons(self.data)
+        
+        # 如果video_processor存在，则检查并标记已处理的样本
+        if hasattr(self, 'video_processor') and self.video_processor is not None:
+            output_dir = self.video_processor.output_dir
+            processed_count = 0
+            
+            logging.info(f"[Rank {self.gpu_rank}] 开始检查已处理的样本，原始样本数量: {len(cap_lists)}")
+            
+            for item in cap_lists:
+                video_path = item["path"]
+                video_name = os.path.basename(video_path).split(".")[0]
+                
+                # 构建所有需要检查的文件路径
+                latent_path = os.path.join(output_dir, "latent", f"{video_name}.pt")
+                
+                # 获取base_dir（根据setup_directories函数的逻辑）
+                video_path_obj = Path(video_path)
+                base_dir = self.output_dir
+                
+                face_mask_path = os.path.join(base_dir, "face_mask", f"{video_name}.png")
+                face_emb_path = os.path.join(base_dir, "face_emb", f"{video_name}.pt")
+                audio_emb_path = os.path.join(base_dir, "audio_emb", f"{video_name}.pt")
+                
+                # 检查所有文件是否都存在
+                latent_exists = os.path.exists(latent_path)
+                face_mask_exists = os.path.exists(face_mask_path)
+                face_emb_exists = os.path.exists(face_emb_path)
+                audio_emb_exists = os.path.exists(audio_emb_path)
+                
+                all_exist = (latent_exists and face_mask_exists and 
+                            face_emb_exists and audio_emb_exists)
+                
+                # 如果所有文件都存在，则标记该样本为已处理
+                if all_exist:
+                    processed_count += 1
+                    # 标记样本为已处理
+                    item["is_processed"] = True
+                    # 记录相关文件路径
+                    # latent = torch.load(latent_path)
+                    # length = latent.shape[1]
+                    item["latent_path"] = latent_path
+                    # item['length'] = length
+                    item["face_mask_path"] = face_mask_path
+                    item["face_emb_path"] = face_emb_path
+                    item["audio_emb_path"] = audio_emb_path
+                    
+                    # 将已处理的样本添加到processed_samples列表中
+                    processed_sample = {
+                        "latent_path": f"{video_name}.pt",
+                        # "length": length,
+                        "caption": item["cap"],
+                        "face_mask_path": face_mask_path,
+                        "face_emb_path": face_emb_path,
+                        "audio_emb_path": audio_emb_path
+                    }
+                    dataset_prog.processed_samples.append(processed_sample)
+                    
+                    if processed_count % 1000 == 0 and self.gpu_rank == 0:
+                        logging.info(f"[Rank {self.gpu_rank}] 已标记 {processed_count} 个已处理的样本")
+                else:
+                    # 记录缺失的文件
+                    missing_files = []
+                    if not latent_exists:
+                        missing_files.append("latent")
+                    if not face_mask_exists:
+                        missing_files.append("face_mask")
+                    if not face_emb_exists:
+                        missing_files.append("face_emb")
+                    if not audio_emb_exists:
+                        missing_files.append("audio_emb")
+                    
+                    if self.gpu_rank == 0 and len(missing_files) > 0 and len(missing_files) % 100 == 0:
+                        logging.info(f"[Rank {self.gpu_rank}] 视频 {video_name} 缺少文件: {', '.join(missing_files)}")
+            
+            logging.info(f"[Rank {self.gpu_rank}] 检查完成: 已标记 {processed_count} 个已处理的样本，总样本数量: {len(cap_lists)}")
+            return cap_lists
+        
         return cap_lists

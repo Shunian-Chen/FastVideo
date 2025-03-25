@@ -69,6 +69,7 @@ def get_dit_fsdp_kwargs(
     use_lora=False,
     cpu_offload=False,
     master_weight_type="fp32",
+    train_subset_params=False,
 ):
     no_split_modules = get_no_split_modules(transformer)
     if use_lora:
@@ -104,10 +105,17 @@ def get_dit_fsdp_kwargs(
         "cpu_offload": cpu_offload,
     }
 
-    # Add LoRA-specific settings when LoRA is enabled
+    # 当使用LoRA或只训练部分参数时的设置
     if use_lora:
         fsdp_kwargs.update({
             "use_orig_params": False,  # Required for LoRA memory savings
+            "sync_module_states": True,
+        })
+    
+    # 如果只训练模型的一部分参数（例如音频相关参数），需要设置use_orig_params=True
+    if train_subset_params:
+        fsdp_kwargs.update({
+            "use_orig_params": True,
             "sync_module_states": True,
         })
 

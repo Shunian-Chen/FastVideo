@@ -19,7 +19,7 @@ from .sgm.utils.util import convert_video_to_images, extract_audio_from_videos, 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
-def setup_directories(video_path: Path) -> dict:
+def setup_directories(video_path: Path, output_dir: Path) -> dict:
     """
     Setup directories for storing processed files.
 
@@ -29,7 +29,7 @@ def setup_directories(video_path: Path) -> dict:
     Returns:
         dict: A dictionary containing paths for various directories.
     """
-    base_dir = video_path.parent.parent
+    base_dir = output_dir
     dirs = {
         "face_mask": base_dir / "face_mask",
         "face_emb": base_dir / "face_emb",
@@ -43,13 +43,16 @@ def setup_directories(video_path: Path) -> dict:
 
 
 class VideoProcessor:
-    def __init__(self, output_dir: Path, 
+    def __init__(self, args,
+                 output_dir: Path, 
                  image_processor: ImageProcessorForDataProcessing, 
                  audio_processor: AudioProcessor,
                  ):
         self.output_dir = output_dir
         self.image_processor = image_processor
         self.audio_processor = audio_processor
+        self.max_height = args.max_height
+        self.max_width = args.max_width
         # self.transform = transform  # 依赖注入
 
     def process(self, video_path: Path,
@@ -57,7 +60,7 @@ class VideoProcessor:
              frame_indices: List[int]
              ) -> None:
         assert video_path.exists(), f"Video path {video_path} does not exist"
-        dirs = setup_directories(video_path)
+        dirs = setup_directories(video_path, self.output_dir)
         logging.info(f"Processing video: {video_path}")
 
         try:
@@ -77,7 +80,11 @@ class VideoProcessor:
             new_video_path.parent.mkdir(parents=True, exist_ok=True)
             
             # 获取原始视频的fps
-            fps = get_fps(video_path)
+            try:
+                fps = get_fps(video_path)
+            except Exception as e:
+                logging.warning(f"获取视频FPS失败: {e}，使用默认值25")
+                fps = 25.0
             
             # 检查frame_indices是否为空
             if not frame_indices:
@@ -109,13 +116,23 @@ class VideoProcessor:
                 images_output_dir = self.output_dir / 'images' / video_path.stem
                 images_output_dir.mkdir(parents=True, exist_ok=True)
                 try:
+                    # 清空目录，避免之前处理失败的残留文件
+                    for file in images_output_dir.glob('*'):
+                        file.unlink()
+                        
                     images_output_dir = convert_video_to_images(
                         new_video_path, images_output_dir)
                     logging.info(f"Images saved to: {images_output_dir}")
+                    
+                    # 验证图像是否成功生成
+                    image_files = list(images_output_dir.glob('*.jpg'))
+                    if not image_files:
+                        raise Exception("未能生成任何图像文件")
+                        
                 except Exception as e:
                     logging.error(f"视频转换为图像失败: {e}")
                     # 创建空的掩码和嵌入向量
-                    empty_mask = np.zeros((480, 848), dtype=np.uint8)
+                    empty_mask = np.zeros((self.max_height, self.max_width), dtype=np.uint8)
                     cv2.imwrite(str(face_mask_path), empty_mask)
                     empty_emb = torch.zeros(512, dtype=torch.float32)
                     torch.save(empty_emb, str(face_emb_path))
@@ -145,7 +162,7 @@ class VideoProcessor:
                     logging.warning(f"No face detected in video: {video_path.stem}, creating empty face mask")
                     # 获取视频的第一帧以确定尺寸
                     try:
-                        first_frame_path = next((p for p in images_output_dir.glob('*.png') if os.path.exists(p)), None)
+                        first_frame_path = next((p for p in images_output_dir.glob('*.jpg') if os.path.exists(p)), None)
                         if first_frame_path:
                             try:
                                 first_frame = cv2.imread(str(first_frame_path))
@@ -154,16 +171,16 @@ class VideoProcessor:
                                     face_mask = np.zeros((height, width), dtype=np.uint8)
                                 else:
                                     # 如果无法读取图像，使用默认尺寸
-                                    face_mask = np.zeros((480, 848), dtype=np.uint8)
+                                    face_mask = np.zeros((self.max_height, self.max_width), dtype=np.uint8)
                             except Exception as e:
                                 logging.error(f"读取第一帧失败: {e}")
-                                face_mask = np.zeros((480, 848), dtype=np.uint8)
+                                face_mask = np.zeros((self.max_height, self.max_width), dtype=np.uint8)
                         else:
                             # 如果没有找到帧，使用默认尺寸
-                            face_mask = np.zeros((480, 848), dtype=np.uint8)
+                            face_mask = np.zeros((self.max_height, self.max_width), dtype=np.uint8)
                     except Exception as e:
                         logging.error(f"获取第一帧路径失败: {e}")
-                        face_mask = np.zeros((480, 848), dtype=np.uint8)
+                        face_mask = np.zeros((self.max_height, self.max_width), dtype=np.uint8)
                 
                 try:
                     face_mask = torch.from_numpy(face_mask).unsqueeze(0).unsqueeze(0)   # (1, 1, H, W)
@@ -190,7 +207,7 @@ class VideoProcessor:
                     logging.error(f"保存人脸掩码失败: {e}")
                     # 尝试再次创建一个空掩码并保存
                     try:
-                        empty_mask = np.zeros((224, 224), dtype=np.uint8)
+                        empty_mask = np.zeros((self.max_height, self.max_width), dtype=np.uint8)
                         cv2.imwrite(str(face_mask_path), empty_mask)
                         logging.warning(f"创建并保存了空的人脸掩码: {face_mask_path}")
                     except Exception as e2:
@@ -227,7 +244,7 @@ class VideoProcessor:
                 audio_output_path = audio_output_dir / f'{new_video_path.stem}.wav'
                 
                 # 检查是否存在与原始视频同名的音频文件（用于没有音轨的视频）
-                original_audio_path = self.output_dir / 'original_audio' / f'{new_video_path.stem}.wav'
+                original_audio_path = self.output_dir / 'original_audio' / f'{new_video_path.stem}.m4a'
                 
                 # 如果视频有音频轨道，则从视频中提取音频
                 if has_audio:
@@ -262,7 +279,7 @@ class VideoProcessor:
                     # 计时
                     start_time_proc = time.time()
                     try:
-                        audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=24.0)
+                        audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=24.0, target_length=len(frame_indices))
                         # audio_emb, _ = self.audio_processor.preprocess(audio_output_path, fps=fps)
                         elapsed_time = time.time() - start_time_proc
                         logging.info(f"[time] Audio preprocessing completed in {elapsed_time:.2f} seconds")    

@@ -5,7 +5,10 @@ import math
 import os
 import sys
 import time
+import json
+import datetime
 from collections import deque
+import numpy as np
 
 import torch
 import torch.distributed as dist
@@ -53,6 +56,189 @@ logger.add(sys.stdout, level="WARNING")
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.31.0")
+
+
+class AnomalyDetector:
+    def __init__(self, 
+                 output_dir,
+                 rank,
+                 window_size=50, 
+                 loss_threshold_factor=3.0, 
+                 grad_norm_threshold_factor=3.0,
+                 fixed_loss_threshold=None,
+                 fixed_grad_norm_threshold=None):
+        """
+        初始化异常检测器
+        
+        参数:
+            output_dir: 输出目录
+            rank: 进程ID
+            window_size: 滑动窗口大小
+            loss_threshold_factor: 损失阈值因子 (均值 + factor * 标准差)
+            grad_norm_threshold_factor: 梯度范数阈值因子
+            fixed_loss_threshold: 固定损失阈值，若设置则覆盖动态阈值
+            fixed_grad_norm_threshold: 固定梯度范数阈值，若设置则覆盖动态阈值
+        """
+        self.output_dir = output_dir
+        self.rank = rank
+        self.window_size = window_size
+        self.loss_threshold_factor = loss_threshold_factor
+        self.grad_norm_threshold_factor = grad_norm_threshold_factor
+        self.fixed_loss_threshold = fixed_loss_threshold
+        self.fixed_grad_norm_threshold = fixed_grad_norm_threshold
+        
+        # 创建输出目录
+        self.anomaly_dir = os.path.join(output_dir, "anomalies")
+        self.anomaly_data_dir = os.path.join(self.anomaly_dir, "data")
+        os.makedirs(self.anomaly_dir, exist_ok=True)
+        os.makedirs(self.anomaly_data_dir, exist_ok=True)
+        
+        # 初始化滑动窗口
+        self.loss_window = deque(maxlen=window_size)
+        self.grad_norm_window = deque(maxlen=window_size)
+        
+        # 初始化JSONL文件
+        self.jsonl_path = os.path.join(self.anomaly_dir, f"anomalies_rank_{rank}.jsonl")
+        
+    def update(self, loss, grad_norm):
+        """更新滑动窗口"""
+        self.loss_window.append(loss)
+        self.grad_norm_window.append(grad_norm)
+        
+    def is_anomaly(self, loss, grad_norm):
+        """检测当前值是否为异常"""
+        # 如果窗口未满一半，不检测异常
+        if len(self.loss_window) < self.window_size // 4:  # 从window_size // 2改为window_size // 4，更早开始检测
+            return False, {}
+        
+        # 计算动态阈值（使用中位数而不是均值，更加鲁棒）
+        loss_list = list(self.loss_window)
+        grad_norm_list = list(self.grad_norm_window)
+        
+        # 计算中位数 - 比均值更鲁棒，不受极端值影响
+        loss_median = float(np.median(loss_list))
+        grad_norm_median = float(np.median(grad_norm_list))
+        
+        # 计算MAD（中位数绝对偏差）- 比标准差更鲁棒
+        loss_mad = float(np.median(np.abs(np.array(loss_list) - loss_median)))
+        grad_norm_mad = float(np.median(np.abs(np.array(grad_norm_list) - grad_norm_median)))
+        
+        # 当MAD为0时（例如多个相同的值），使用标准差的备选方案
+        if loss_mad == 0:
+            loss_mad = float(np.std(loss_list))
+        if grad_norm_mad == 0:
+            grad_norm_mad = float(np.std(grad_norm_list))
+        
+        # 动态阈值（基于中位数和MAD）
+        # 通常MAD的系数要比标准差的系数大，因为MAD通常小于标准差
+        # MAD系数 = 标准差系数 * 1.4826（正态分布下MAD与标准差的关系）
+        mad_factor = self.loss_threshold_factor * 1.4826
+        
+        loss_threshold = self.fixed_loss_threshold if self.fixed_loss_threshold is not None else \
+                        (loss_median + mad_factor * loss_mad)
+        grad_norm_threshold = self.fixed_grad_norm_threshold if self.fixed_grad_norm_threshold is not None else \
+                             (grad_norm_median + mad_factor * grad_norm_mad)
+        
+        # 为了参考，仍然计算均值和标准差
+        loss_mean = float(np.mean(loss_list))
+        loss_std = float(np.std(loss_list))
+        grad_norm_mean = float(np.mean(grad_norm_list))
+        grad_norm_std = float(np.std(grad_norm_list))
+        
+        # 检测异常：除了标准偏差外，还检测相对于均值的突变
+        is_loss_anomaly = loss > loss_threshold
+        is_grad_anomaly = grad_norm > grad_norm_threshold
+        
+        # 增加相对变化率检测：如果当前值比前一个时间步的值突然增加过多
+        relative_loss_change = 0
+        relative_grad_change = 0
+        if len(self.loss_window) > 1:
+            prev_loss = self.loss_window[-1]
+            if prev_loss > 0:
+                relative_loss_change = (loss - prev_loss) / prev_loss
+            
+            prev_grad = self.grad_norm_window[-1]
+            if prev_grad > 0:
+                relative_grad_change = (grad_norm - prev_grad) / prev_grad
+        
+        # 如果相对变化率超过50%，也认为是异常
+        is_loss_spike = relative_loss_change > 0.5
+        is_grad_spike = relative_grad_change > 0.5
+        
+        threshold_info = {
+            "loss_median": loss_median,
+            "loss_mad": loss_mad,
+            "loss_threshold": float(loss_threshold),
+            "grad_norm_median": grad_norm_median,
+            "grad_norm_mad": grad_norm_mad,
+            "grad_norm_threshold": float(grad_norm_threshold),
+            "loss_mean": loss_mean,  # 保留均值和标准差以便参考
+            "loss_std": loss_std,
+            "grad_norm_mean": grad_norm_mean,
+            "grad_norm_std": grad_norm_std,
+            "relative_loss_change": float(relative_loss_change),
+            "relative_grad_change": float(relative_grad_change)
+        }
+        
+        # 任一条件满足即为异常
+        return (is_loss_anomaly or is_grad_anomaly or is_loss_spike or is_grad_spike), threshold_info
+    
+    def save_batch_data(self, step, batch_data):
+        """保存批次数据"""
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        data_dir = os.path.join(self.anomaly_data_dir, f"step_{step}_rank_{self.rank}_{timestamp}")
+        os.makedirs(data_dir, exist_ok=True)
+        
+        batch_info = {}
+        
+        # 保存各种张量数据
+        for key, value in batch_data.items():
+            if isinstance(value, torch.Tensor):
+                file_path = os.path.join(data_dir, f"{key}.pt")
+                torch.save(value, file_path)
+                batch_info[f"{key}_shape"] = list(value.shape)
+                batch_info[f"{key}_path"] = os.path.relpath(file_path, self.output_dir)
+            elif isinstance(value, list) and value and isinstance(value[0], str):
+                # 假设是文件路径列表
+                batch_info[f"{key}"] = value
+            else:
+                # 其他类型的数据直接添加到info中
+                try:
+                    json.dumps({key: value})  # 测试是否可JSON序列化
+                    batch_info[key] = value
+                except:
+                    batch_info[key] = str(value)
+        
+        return data_dir, batch_info
+    
+    def log_anomaly(self, step, loss, grad_norm, batch_data, checkpoint_path=None):
+        """记录异常"""
+        # 检查是否为异常
+        is_anomaly, threshold_info = self.is_anomaly(loss, grad_norm)
+        if not is_anomaly:
+            return False
+        
+        # 保存批次数据
+        data_dir, batch_info = self.save_batch_data(step, batch_data)
+        
+        # 记录异常信息
+        anomaly_info = {
+            "step": step,
+            "rank": self.rank,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "loss": float(loss),
+            "grad_norm": float(grad_norm),
+            "batch_info": batch_info,
+            "model_checkpoint": checkpoint_path,
+            "threshold_info": threshold_info,
+            "data_dir": os.path.relpath(data_dir, self.output_dir)
+        }
+        
+        # 写入JSONL文件
+        with open(self.jsonl_path, "a") as f:
+            f.write(json.dumps(anomaly_info) + "\n")
+        
+        return True
 
 
 def compute_density_for_timestep_sampling(
@@ -135,6 +321,7 @@ def train_one_step(
                 encoder_attention_mask,
                 audio_embeds,
                 face_embeds,
+                face_mask,
                 audio_embed_file,
             ) = next(loader)
         else:
@@ -144,21 +331,11 @@ def train_one_step(
                 latents_attention_mask,
                 encoder_attention_mask,
             ) = next(loader)
-        # print(f"audio_embeds from train_one_step loader: {audio_embeds.shape}")
-        # print(f"audio_embed_file from train_one_step loader: {audio_embed_file}")
-        if audio_embeds.shape[0] == 0:
-            print("*"*80)
-            print(f"audio_embeds_file{audio_embed_file} is empty")
-            print("*"*80)
-            continue
-        logger.info(f"data received")
-        logger.info(f"latents: {latents.shape}")
+
+
         latents = normalize_dit_input(model_type, latents)
-        logger.info(f"latents normalized")
         batch_size = latents.shape[0]
-        logger.info(f"batch_size: {batch_size}")
         noise = torch.randn_like(latents)
-        logger.info(f"noise: {noise.shape}")
         u = compute_density_for_timestep_sampling(
             weighting_scheme=weighting_scheme,
             batch_size=batch_size,
@@ -168,14 +345,11 @@ def train_one_step(
             mode_scale=mode_scale,
         )
         indices = (u * noise_scheduler.config.num_train_timesteps).long()
-        logger.info(f"indices: {indices.shape}")
         timesteps = noise_scheduler.timesteps[indices].to(
             device=latents.device)
-        logger.info(f"timesteps: {timesteps.shape}")
         if sp_size > 1:
             # Make sure that the timesteps are the same across all sp processes.
             broadcast(timesteps)
-            logger.info(f"timesteps broadcasted")
         sigmas = get_sigmas(
             noise_scheduler,
             latents.device,
@@ -184,7 +358,6 @@ def train_one_step(
             dtype=latents.dtype,
         )
         noisy_model_input = (1.0 - sigmas) * latents + sigmas * noise
-        logger.info(f"noisy_model_input: {noisy_model_input.shape}")
         with torch.autocast("cuda", dtype=torch.bfloat16):
             input_kwargs = {
                 "hidden_states": noisy_model_input,
@@ -200,26 +373,22 @@ def train_one_step(
                     [1000.0],
                     device=noisy_model_input.device,
                     dtype=torch.bfloat16)
-            logger.info(f"latents: {latents.shape}")
-            logger.info(f"encoder_hidden_states: {encoder_hidden_states.shape}")
-            logger.info(f"latents_attention_mask: {latents_attention_mask.shape}")
-            logger.info(f"encoder_attention_mask: {encoder_attention_mask.shape}")
-            logger.info(f"audio_embeds: {audio_embeds.shape}")
-            # print(f"audio_embeds in train_one_step: {audio_embeds.shape}")
-            logger.info(f"face_embeds: {face_embeds.shape}")
             model_pred = transformer(**input_kwargs)[0]
-            logger.info(f"="*80)
-            logger.info(f"model_pred: {model_pred.shape}")
-            logger.info(f"="*80)
+
         if precondition_outputs:
             model_pred = noisy_model_input - model_pred * sigmas
         if precondition_outputs:
             target = latents
         else:
             target = noise - latents
-
-        loss = (torch.mean((model_pred.float() - target.float())**2) /
-                gradient_accumulation_steps)
+        print(f"model_pred.shape: {model_pred.shape}, target.shape: {target.shape}")
+        print(f"face_mask.shape: {face_mask.shape}")
+        # 根据face_mask，将model_pred和target中face_mask为0的部分设置为0
+        model_pred = model_pred * face_mask
+        target = target * face_mask
+        # 只针对face_mask为1的部分计算loss
+        loss = ((torch.mean((model_pred.float() - target.float())**2) * face_mask) /
+                (torch.mean(face_mask) * gradient_accumulation_steps + 1e-8))
 
         loss.backward()
 
@@ -255,6 +424,17 @@ def main(args):
     if rank <= 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
 
+    # 初始化异常检测器
+    anomaly_detector = AnomalyDetector(
+        output_dir=args.output_dir,
+        rank=rank,
+        window_size=50,
+        loss_threshold_factor=2.0,     # 从3.0降低到2.0，使其更容易捕获波动
+        grad_norm_threshold_factor=2.0, # 从3.0降低到2.0，使其更容易捕获波动
+        fixed_loss_threshold=0.3,      # 从0.5降低到0.3，降低固定阈值
+        fixed_grad_norm_threshold=1.0   # 从1.5降低到1.0，降低固定阈值
+    )
+
     # For mixed precision training we cast all non-trainable weights to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
 
@@ -268,6 +448,32 @@ def main(args):
         args.pretrained_model_name_or_path,
         torch.float32 if args.master_weight_type == "fp32" else torch.bfloat16,
     )
+
+    
+    if args.train_audio_only:
+        total_train_params = 0
+        params_to_optimize = []
+        main_print("--> 只训练与音频相关的参数")
+        audio_param_patterns = [
+            "audio_scale",
+            "audio_norm",
+            "audio_attn_qkv",
+            "audio_attn_q_norm",
+            "audio_attn_k_norm",
+            "audio_proj"
+        ]
+
+        for name, param in transformer.named_parameters():
+            for pattern in audio_param_patterns:
+                if pattern in name:
+                    total_train_params += param.numel()
+                    params_to_optimize.append(param)
+        main_print(f"  音频相关训练参数数量 = {total_train_params / 1e6} M")
+    else:
+        params_to_optimize = transformer.parameters()
+        params_to_optimize = list(
+            filter(lambda p: p.requires_grad, params_to_optimize))
+        total_train_params = sum(p.numel() for p in transformer.parameters() if p.requires_grad) / 1e6
 
     if args.use_lora:
         assert args.model_type != "hunyuan", "LoRA is only supported for huggingface model. Please use hunyuan_hf for lora finetuning"
@@ -306,7 +512,7 @@ def main(args):
                     f" {unexpected_keys}. ")
 
     main_print(
-        f"  Total training parameters = {sum(p.numel() for p in transformer.parameters() if p.requires_grad) / 1e6} M"
+        f"  Total training parameters = {total_train_params} M"
     )
     main_print(
         f"--> Initializing FSDP with sharding strategy: {args.fsdp_sharding_startegy}"
@@ -317,6 +523,7 @@ def main(args):
         args.use_lora,
         args.use_cpu_offload,
         args.master_weight_type,
+        train_subset_params=args.train_audio_only,
     )
 
     if args.use_lora:
@@ -346,9 +553,6 @@ def main(args):
 
     noise_scheduler = FlowMatchEulerDiscreteScheduler()
 
-    params_to_optimize = transformer.parameters()
-    params_to_optimize = list(
-        filter(lambda p: p.requires_grad, params_to_optimize))
 
     optimizer = torch.optim.AdamW(
         params_to_optimize,
@@ -472,6 +676,43 @@ def main(args):
         next(loader)
     for step in range(init_steps + 1, args.max_train_steps + 1):
         start_time = time.time()
+        
+        # 获取当前批次数据
+        if "audio" in args.model_type:
+            (
+                latents,
+                encoder_hidden_states,
+                latents_attention_mask,
+                encoder_attention_mask,
+                audio_embeds,
+                face_embeds,
+                face_mask,
+                audio_embed_file,
+            ) = next(loader)
+            batch_data = {
+                "latents": latents.cpu().detach(),
+                "encoder_hidden_states": encoder_hidden_states.cpu().detach(),
+                "latents_attention_mask": latents_attention_mask.cpu().detach(),
+                "encoder_attention_mask": encoder_attention_mask.cpu().detach(),
+                "audio_embeds": audio_embeds.cpu().detach() if audio_embeds is not None else None,
+                "face_embeds": face_embeds.cpu().detach() if face_embeds is not None else None,
+                "audio_embed_file": audio_embed_file,
+                "face_mask": face_mask.cpu().detach() if face_mask is not None else None,
+            }
+        else:
+            (
+                latents,
+                encoder_hidden_states,
+                latents_attention_mask,
+                encoder_attention_mask,
+            ) = next(loader)
+            batch_data = {
+                "latents": latents.cpu().detach(),
+                "encoder_hidden_states": encoder_hidden_states.cpu().detach(),
+                "latents_attention_mask": latents_attention_mask.cpu().detach(),
+                "encoder_attention_mask": encoder_attention_mask.cpu().detach()
+            }
+        
         loss, grad_norm = train_one_step(
             transformer,
             args.model_type,
@@ -500,6 +741,30 @@ def main(args):
             "grad_norm": grad_norm,
         })
         progress_bar.update(1)
+        
+        # 更新异常检测器并检查是否有异常
+        anomaly_detector.update(loss, grad_norm)
+        
+        # 获取最新的检查点路径
+        latest_checkpoint = None
+        if step > args.checkpointing_steps:
+            checkpoint_step = (step // args.checkpointing_steps) * args.checkpointing_steps
+            latest_checkpoint = os.path.join(args.output_dir, f"checkpoint-{checkpoint_step}")
+            if not os.path.exists(latest_checkpoint):
+                latest_checkpoint = None
+        
+        # 记录异常
+        is_anomaly = anomaly_detector.log_anomaly(
+            step=step,
+            loss=loss,
+            grad_norm=grad_norm,
+            batch_data=batch_data,
+            checkpoint_path=latest_checkpoint
+        )
+        
+        if is_anomaly:
+            main_print(f"Rank {rank}, Step {step}: Detected anomaly, loss={loss:.4f}, grad_norm={grad_norm:.4f}")
+        
         if rank <= 0:
             wandb.log(
                 {
@@ -818,6 +1083,11 @@ if __name__ == "__main__":
         type=str,
         default="fp32",
         help="Weight type to use - fp32 or bf16.",
+    )
+    parser.add_argument(
+        "--train_audio_only",
+        action="store_true",
+        help="只训练与音频相关的参数",
     )
 
     args = parser.parse_args()
