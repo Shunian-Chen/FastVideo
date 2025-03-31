@@ -738,14 +738,14 @@ class HYVideoDiffusionTransformerAudio(ModelMixin, ConfigMixin):
         
         frame_num = hidden_states.shape[2]
         # print(f"frame_num: {frame_num}")
-        print(f"hidden_states shape: {hidden_states.shape}")
+        # print(f"hidden_states shape: {hidden_states.shape}")
 
         # 处理audio_emb和face_emb,参考BaseTransformer的处理方式
         if audio_emb is not None:
 
-            print(f"audio_emb shape before proj: {audio_emb.shape}")
+            # print(f"audio_emb shape before proj: {audio_emb.shape}")
             audio_emb = self.audio_proj(audio_emb)
-            print(f"audio_emb shape after proj: {audio_emb.shape}")
+            # print(f"audio_emb shape after proj: {audio_emb.shape}")
             _, f, _ = audio_emb.shape
             assert f==frame_num, print(f"audio_emb frame_num: {f}, hidden_states frame_num: {frame_num}")
             # audio_emb = rearrange(audio_emb, "b f m c -> (b f) m c")

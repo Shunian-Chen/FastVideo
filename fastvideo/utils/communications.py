@@ -447,7 +447,7 @@ def prepare_sequence_parallel_data_audio(hidden_states, encoder_hidden_states,
         # 拼接到原张量上完成padding
         audio_emb = torch.cat([audio_emb, zeros_pad], dim=1)
 
-
+    # print(f"audio_emb.shape after padding: {audio_emb.shape}")
     (
         hidden_states,
         encoder_hidden_states,
@@ -465,7 +465,7 @@ def prepare_sequence_parallel_data_audio(hidden_states, encoder_hidden_states,
         face_emb.repeat(1, sp_size),
         face_mask,
     )
-
+    # print(f"audio_emb.shape after prepare: {audio_emb.shape}")
     # print(f"Inside prepare_sequence_parallel_data_audio, after prepare, latent shape: {hidden_states.shape}")
     # print(f"Inside prepare_sequence_parallel_data_audio, after prepare, audio_emb shape: {audio_emb.shape}")
     # print(f"Inside prepare_sequence_parallel_data_audio, after prepare, face_emb shape: {face_emb.shape}")
@@ -477,6 +477,7 @@ def sp_parallel_dataloader_wrapper_audio(dataloader, device, train_batch_size,
     while True:
         for data_item in dataloader:
             latents, cond, attn_mask, cond_mask, audio_emb, face_emb, face_mask, audio_embed_file = data_item
+            # print(f"audio_embed.shape in sp_parallel_dataloader_wrapper_audio: {audio_emb.shape}")
             # print(f"Inside sp_parallel_dataloader_wrapper, latents shape: {latents.shape}")
             # print(f"Inside sp_parallel_dataloader_wrapper, audio_emb shape: {audio_emb.shape}")
             # print(f"Inside sp_parallel_dataloader_wrapper, face_emb shape: {face_emb.shape}")
@@ -520,7 +521,7 @@ def sp_parallel_dataloader_wrapper_audio(dataloader, device, train_batch_size,
                     audio_emb_t = audio_emb[st_idx:ed_idx]
                     face_emb_t = face_emb[st_idx:ed_idx]
                     face_mask_t = face_mask[st_idx:ed_idx]
-
+                    # print(f"audio_emb_t.shape: {audio_emb_t.shape}")
                     # print(f"Inside sp_parallel_dataloader_wrapper, latent_t shape: {latent_t.shape}")
                     # print(f"Inside sp_parallel_dataloader_wrapper, audio_emb shape: {audio_emb_t.shape}")
                     # print(f"Inside sp_parallel_dataloader_wrapper, face_emb shape: {face_emb_t.shape}")

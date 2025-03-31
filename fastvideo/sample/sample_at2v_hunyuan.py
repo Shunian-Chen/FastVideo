@@ -38,7 +38,7 @@ import torch.distributed as dist
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from glob import glob
+import glob
 from collections import defaultdict
 from PIL import Image
 from pathlib import Path
@@ -171,6 +171,7 @@ def parse_args():
         help="Denoising type (flow matching etc.).",
     )
     parser.add_argument("--data_dir", type=str, default=None, help="数据目录")
+    parser.add_argument("--max_samples", type=int, default=None, help="要处理的最大样本数量")
     return parser.parse_args()
 
 def process_audio_emb(audio_emb):
@@ -222,14 +223,17 @@ def main():
         args.output_path = args.output_dir
     
     # 初始化分布式
+    local_rank = 0
+    world_size = 1
     if torch.cuda.is_available():
         local_rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         print(f"local_rank: {local_rank}, world_size: {world_size}")
         torch.cuda.set_device(local_rank)
-        if dist.is_available() and not dist.is_initialized():
+        if world_size > 1 and dist.is_available() and not dist.is_initialized():
             dist.init_process_group("nccl", init_method="env://", world_size=world_size, rank=local_rank)
-        initialize_sequence_parallel_state(args.sp_size)
+        if args.sp_size > 1:
+             initialize_sequence_parallel_state(args.sp_size)
 
     models_root_path = Path(args.model_path)
     if not models_root_path.exists():
@@ -271,29 +275,104 @@ def main():
     if not data_items:
         print("没有找到有效的数据，请使用 --use_v2c_format --input_path 或者 --audio_emb_path 参数")
         return
-    
-    # 处理每个数据项
-    for idx, item in enumerate(data_items):
-        print(f"\n处理数据项 {idx+1}/{len(data_items)}")
-        
+
+    # 应用 max_samples 限制 (在分片之前对总数据进行截断)
+    total_items_before_limit = len(data_items)
+    if args.max_samples is not None and args.max_samples > 0:
+        if args.max_samples < len(data_items):
+            data_items = data_items[:args.max_samples]
+            print(f"已将处理样本数限制为: {args.max_samples} (原总数: {total_items_before_limit})")
+        else:
+            print(f"请求的最大样本数 ({args.max_samples}) 大于或等于可用样本数 ({len(data_items)})，将处理所有可用样本。")
+    total_items_to_process = len(data_items) # 更新要处理的总数
+
+    # 如果在分布式环境中运行，对数据进行分片处理
+    if world_size > 1:
+        # 计算每个进程应处理的数据项
+        items_per_rank = (total_items_to_process + world_size - 1) // world_size  # 向上取整
+        start_idx = local_rank * items_per_rank
+        end_idx = min(start_idx + items_per_rank, total_items_to_process)
+
+        # 获取当前rank应处理的数据子集
+        rank_data_items = data_items[start_idx:end_idx]
+        print(f"Rank {local_rank}: 将处理 {len(rank_data_items)} 个数据项 (总共 {total_items_to_process}), 索引范围: {start_idx}-{end_idx-1 if end_idx > start_idx else start_idx}")
+    else:
+        rank_data_items = data_items
+        start_idx = 0
+
+    # 处理每个数据项（仅处理当前进程分配的数据）
+    processed_count_rank = 0 # 当前 rank 处理的计数器
+    skipped_count_rank = 0 # 当前 rank 跳过的计数器
+    for idx, item in enumerate(rank_data_items):
+        # 计算全局索引，用于日志显示和可能的全局限制检查 (虽然限制已在分片前应用)
+        global_idx = start_idx + idx if world_size > 1 else idx
+
+        # 再次检查全局索引是否超出限制 (理论上不会，因为已在分片前截断)
+        if args.max_samples is not None and args.max_samples > 0 and global_idx >= args.max_samples:
+             print(f"Rank {local_rank}: 已达到全局最大样本数 {args.max_samples}，停止处理。")
+             break # 如果因为某种原因之前的截断没生效，这里再加一层保险
+
+        print(f"\nRank {local_rank}: 检查数据项 {global_idx+1}/{total_items_to_process} (本rank: {idx+1}/{len(rank_data_items)})")
+
         # 获取说明文本
         caption = item.get("caption", args.caption)
         if not caption:
             caption = "一个人在说话"
-        print(f"使用说明文本: {caption}")
-        
-        # 加载音频嵌入
+        # print(f"使用说明文本: {caption}") # 移动到后面，避免跳过时也打印
+
+        # 获取音频嵌入路径
         audio_emb_path = item.get("audio_emb_path")
         if not audio_emb_path:
             print("警告: 未找到音频嵌入路径，跳过")
+            skipped_count_rank += 1
             continue
-        
+
         # 确保路径是绝对路径
         if not os.path.isabs(audio_emb_path):
-            audio_emb_path = os.path.join(args.data_dir, "audio_emb", audio_emb_path)
-        
+            # 假设 audio_emb_path 是相对于 data_dir/audio_emb 的路径
+            # 例如: "some_audio.pt"
+            relative_audio_emb_path = audio_emb_path
+            if args.data_dir:
+                 audio_emb_path = os.path.join(args.data_dir, "audio_emb", relative_audio_emb_path)
+            else:
+                 # 如果没有 data_dir，尝试基于 input_path 的目录
+                 if args.input_path:
+                     base_input_dir = os.path.dirname(args.input_path)
+                     audio_emb_path = os.path.join(base_input_dir, "audio_emb", relative_audio_emb_path)
+                 else:
+                     # 无法确定绝对路径，可能需要报错或采取默认行为
+                     print(f"警告: 无法确定音频嵌入文件的绝对路径: {relative_audio_emb_path}，且未提供 --data_dir。尝试在当前目录查找。")
+                     audio_emb_path = os.path.join("audio_emb", relative_audio_emb_path) # 最后尝试
+
+        # 提取 audio_name 用于文件名检查
+        audio_name = os.path.splitext(os.path.basename(item.get("audio_emb_path")))[0] # 使用原始相对路径中的文件名部分
+        caption_hash = hashlib.sha1(caption.encode()).hexdigest()[:8]
+
+        # --- 断点续传检查 ---
+        # 构造用于搜索的文件名模式 (使用 audio_name, caption_hash, global_idx, 并用 * 匹配时间戳)
+        search_pattern = f"{audio_name}_{caption_hash}_*_id{global_idx}.mp4"
+        search_path = os.path.join(args.output_path, search_pattern)
+
+        # 检查是否存在匹配的文件
+        existing_files = glob.glob(search_path)
+        if existing_files:
+            print(f"Rank {local_rank}: 找到已存在的视频 {existing_files[0]} (匹配模式: {search_pattern})，跳过生成。")
+            skipped_count_rank += 1
+            continue # 跳到下一个 item
+        # --- 检查结束 ---
+
+        # 如果没有跳过，继续处理
+        print(f"Rank {local_rank}: 处理数据项 {global_idx+1}/{total_items_to_process} (本rank: {idx+1}/{len(rank_data_items)})")
+        print(f"使用说明文本: {caption}")
+
         # 加载音频嵌入数据
         try:
+            # 检查文件是否存在
+            if not os.path.exists(audio_emb_path):
+                 print(f"错误: 音频嵌入文件不存在: {audio_emb_path}，跳过。")
+                 skipped_count_rank += 1
+                 continue
+
             audio_embeds = torch.load(audio_emb_path, map_location="cpu")
             if not isinstance(audio_embeds, torch.Tensor):
                 audio_embeds = torch.as_tensor(audio_embeds)
@@ -303,26 +382,30 @@ def main():
                 print(f"音频嵌入形状: {audio_embeds.shape}")
         except Exception as e:
             print(f"加载音频嵌入失败: {e}")
+            skipped_count_rank += 1 # 加载失败也算跳过
             continue
-        
-        # 准备输出路径
+
+        # 准备输出路径 (现在在这里生成时间戳)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        caption_hash = hashlib.sha1(caption.encode()).hexdigest()[:8]
-        audio_name = os.path.splitext(os.path.basename(audio_emb_path))[0]
-        
-        save_name = f"{audio_name}_{caption_hash}_{timestamp}.mp4"
+        # audio_name 和 caption_hash 已在前面计算
+        base_filename = f"{audio_name}_{caption_hash}_{timestamp}_id{global_idx}"
+        save_name = f"{base_filename}.mp4"
+        temp_save_name = f"temp_{base_filename}.mp4" # 临时文件名也包含完整信息
+
         save_path = os.path.join(args.output_path, save_name)
-        
+        temp_video_path = os.path.join(args.output_path, temp_save_name)
+
         # 查找对应的音频文件
         audio_file_path = None
         if args.data_dir:
+            # 使用原始相对路径中的文件名部分来查找 .wav 文件
             audio_wav_path = os.path.join(args.data_dir, "audios", f"{audio_name}.wav")
             if os.path.exists(audio_wav_path):
                 audio_file_path = audio_wav_path
                 print(f"找到对应的音频文件: {audio_file_path}")
             else:
                 print(f"未找到对应的音频文件: {audio_wav_path}")
-        
+
         # 运行推理
         try:
             outputs = sampler.predict(
@@ -368,49 +451,97 @@ def main():
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             
             # 先保存无音频的视频到临时文件
-            temp_video_path = os.path.join(args.output_path, f"temp_{save_name}")
-            print(f"正在保存临时视频到: {temp_video_path}，帧数: {len(frames)}")
-            imageio.mimsave(temp_video_path, frames, fps=args.fps)
-            
+            print(f"Rank {local_rank}: 正在保存临时视频到: {temp_video_path}，帧数: {len(frames)}")
+            try:
+                imageio.mimsave(temp_video_path, frames, fps=args.fps)
+            except Exception as io_err:
+                print(f"Rank {local_rank}: 保存临时视频失败: {io_err}")
+                # 即使保存失败，也增加计数器，因为尝试处理了
+                processed_count_rank += 1
+                continue # 跳过当前项的处理
+
             # 如果找到了音频文件，则合并音频和视频
             if audio_file_path and os.path.exists(audio_file_path):
-                try:
-                    print(f"正在合并音频与视频: {audio_file_path}")
-                    cmd = [
-                        "ffmpeg", "-y", "-v", "error",
-                        "-i", temp_video_path,  # 视频输入
-                        "-i", audio_file_path,  # 音频输入
-                        "-c:v", "copy",         # 直接复制视频流，不重新编码
-                        "-c:a", "aac",          # 使用AAC编码音频
-                        "-shortest",            # 以最短的流长度为准
-                        save_path               # 输出文件
-                    ]
-                    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    
-                    # 删除临时文件
-                    if os.path.exists(temp_video_path):
-                        os.remove(temp_video_path)
-                    
-                    print(f"视频与音频已合并保存: {save_path}")
-                except Exception as e:
-                    print(f"合并音频与视频失败: {e}")
-                    # 如果合并失败，保留无音频的视频
-                    if os.path.exists(temp_video_path):
-                        os.rename(temp_video_path, save_path)
-                    print(f"保存了无音频的视频: {save_path}")
+                # 在调用 ffmpeg 前检查临时文件是否存在
+                if os.path.exists(temp_video_path):
+                    try:
+                        print(f"Rank {local_rank}: 正在合并音频与视频: {audio_file_path} 到 {save_path}")
+                        cmd = [
+                            "ffmpeg", "-y", "-v", "error",
+                            "-i", temp_video_path,  # 视频输入
+                            "-i", audio_file_path,  # 音频输入
+                            "-c:v", "copy",         # 直接复制视频流
+                            "-c:a", "aac",          # 使用AAC编码音频
+                            "-shortest",            # 以最短的流长度为准
+                            save_path               # 输出文件
+                        ]
+                        # 捕获 ffmpeg 的输出以便调试
+                        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300) # 增加超时
+
+                        # 合并成功后删除临时文件
+                        if os.path.exists(temp_video_path):
+                            os.remove(temp_video_path)
+                        
+                        print(f"Rank {local_rank}: 视频与音频已合并保存: {save_path}")
+                    except subprocess.CalledProcessError as e:
+                        print(f"Rank {local_rank}: 合并音频与视频失败 (ffmpeg 返回错误): {e}")
+                        print(f"FFmpeg stdout: {e.stdout}")
+                        print(f"FFmpeg stderr: {e.stderr}")
+                        # 如果合并失败，尝试保留无音频的视频
+                        if os.path.exists(temp_video_path):
+                            try:
+                                os.rename(temp_video_path, save_path)
+                                print(f"Rank {local_rank}: 保存了无音频的视频: {save_path}")
+                            except OSError as rename_err:
+                                print(f"Rank {local_rank}: 重命名临时文件失败: {rename_err}. 临时文件保留在: {temp_video_path}")
+                    except subprocess.TimeoutExpired:
+                        print(f"Rank {local_rank}: 合并音频与视频超时。")
+                        # 超时也尝试保留无音频视频
+                        if os.path.exists(temp_video_path):
+                             try:
+                                os.rename(temp_video_path, save_path)
+                                print(f"Rank {local_rank}: 保存了无音频的视频 (因合并超时): {save_path}")
+                             except OSError as rename_err:
+                                print(f"Rank {local_rank}: 重命名临时文件失败: {rename_err}. 临时文件保留在: {temp_video_path}")
+                    except Exception as e:
+                        print(f"Rank {local_rank}: 合并过程中发生未知错误: {e}")
+                        # 未知错误也尝试保留无音频视频
+                        if os.path.exists(temp_video_path):
+                             try:
+                                os.rename(temp_video_path, save_path)
+                                print(f"Rank {local_rank}: 保存了无音频的视频 (因未知错误): {save_path}")
+                             except OSError as rename_err:
+                                print(f"Rank {local_rank}: 重命名临时文件失败: {rename_err}. 临时文件保留在: {temp_video_path}")
+                else:
+                    # 如果临时视频文件不存在，则无法合并
+                    print(f"Rank {local_rank}: 错误：临时视频文件不存在，无法合并音频: {temp_video_path}")
+                    # 此时无法保存任何视频文件，因为源文件缺失
+
             else:
-                # 如果没有找到音频文件，直接重命名临时视频
-                os.rename(temp_video_path, save_path)
-                print(f"视频已保存(无音频): {save_path}")
+                # 如果没有找到音频文件或音频文件不存在，检查临时文件并重命名
+                if os.path.exists(temp_video_path):
+                    os.rename(temp_video_path, save_path)
+                    print(f"Rank {local_rank}: 视频已保存(无音频): {save_path}")
+                else:
+                    # 如果临时文件此时不存在，说明 imageio 保存失败或被意外删除
+                    print(f"Rank {local_rank}: 错误：临时视频文件不存在，无法保存无音频视频: {temp_video_path}")
             
+            # 成功处理完一个样本，增加计数器
+            processed_count_rank += 1
+
         except Exception as e:
-            print(f"推理失败: {e}")
+            print(f"Rank {local_rank}: 推理或后续处理失败: {e}")
             import traceback
             traceback.print_exc()
-        
+            # 即使失败，也增加计数器，因为尝试处理了
+            # 注意：这里不应该增加 skipped_count_rank，因为我们尝试处理了但失败了
+            # processed_count_rank += 1 # 移动到 try 块末尾，仅在成功时增加
+
         # 释放内存
         torch.cuda.empty_cache()
-    
+
+    print(f"Rank {local_rank}: 处理完成，成功处理了 {processed_count_rank} 个样本，跳过了 {skipped_count_rank} 个样本。")
+
     # 清理分布式组
     if get_sequence_parallel_state():
         destroy_sequence_parallel_group()

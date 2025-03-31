@@ -381,15 +381,14 @@ def train_one_step(
             target = latents
         else:
             target = noise - latents
-        print(f"model_pred.shape: {model_pred.shape}, target.shape: {target.shape}")
-        print(f"face_mask.shape: {face_mask.shape}")
+        # print(f"model_pred.shape: {model_pred.shape}, target.shape: {target.shape}")
+        # print(f"face_mask.shape: {face_mask.shape}")
         # 根据face_mask，将model_pred和target中face_mask为0的部分设置为0
-        model_pred = model_pred * face_mask
-        target = target * face_mask
-        # 只针对face_mask为1的部分计算loss
-        loss = ((torch.mean((model_pred.float() - target.float())**2) * face_mask) /
-                (torch.mean(face_mask) * gradient_accumulation_steps + 1e-8))
 
+        # 只针对face_mask为1的部分计算loss
+        loss = (torch.mean((model_pred.float() - target.float())**2 * face_mask) /
+                (torch.mean(face_mask) * gradient_accumulation_steps + 1e-8))
+        # print(f"有效区域占比: {torch.mean(face_mask).item()}")
         loss.backward()
 
         avg_loss = loss.detach().clone()

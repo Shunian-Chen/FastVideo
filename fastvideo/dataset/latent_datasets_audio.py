@@ -49,38 +49,14 @@ class LatentDatasetAudio(Dataset):
         ]
 
     def process_audio_emb(self, audio_emb):
-        # 检查是否已经有batch维度
-        if len(audio_emb.shape) >= 4:  # 如果已经有至少4个维度，假设第一个是batch_size
-            batch_size = audio_emb.shape[0]
-            frame_num = audio_emb.shape[1]
-            
-            # 为每个batch单独处理
-            processed_batches = []
-            for b in range(batch_size):
-                concatenated_tensors = []
-                
-                for i in range(frame_num):
-                    vectors_to_concat = [
-                        audio_emb[b, max(min(i + j, frame_num-1), 0)] 
-                        for j in range(-2, 3)]
-                    concatenated_tensors.append(torch.stack(vectors_to_concat, dim=0))
-                
-                processed_batches.append(torch.stack(concatenated_tensors, dim=0))
-            
-            # 在batch维度上重新组合处理过的数据
-            audio_emb = torch.stack(processed_batches, dim=0)
-        else:
-            # 原来的处理逻辑，用于单个样本的情况
-            concatenated_tensors = []
-            
-            for i in range(audio_emb.shape[0]):
-                vectors_to_concat = [
-                    audio_emb[max(min(i + j, audio_emb.shape[0]-1), 0)]for j in range(-2, 3)]
-                concatenated_tensors.append(torch.stack(vectors_to_concat, dim=0))
-            
-            audio_emb = torch.stack(concatenated_tensors, dim=0)
-            # 这里处理的是单个样本，结果需要添加batch维度
-            audio_emb = audio_emb.unsqueeze(0)  # 添加batch维度为1
+        concatenated_tensors = []
+
+        for i in range(audio_emb.shape[0]):
+            vectors_to_concat = [
+                audio_emb[max(min(i + j, audio_emb.shape[0]-1), 0)]for j in range(-2, 3)]
+            concatenated_tensors.append(torch.stack(vectors_to_concat, dim=0))
+
+        audio_emb = torch.stack(concatenated_tensors, dim=0)
 
         return audio_emb
 
@@ -129,7 +105,9 @@ class LatentDatasetAudio(Dataset):
             # 确保是tensor类型
             if not isinstance(audio_embed, torch.Tensor):
                 audio_embed = torch.as_tensor(audio_embed)
+            # print(f"audio_embed.shape before processing: {audio_embed.shape}")
             audio_embed = self.process_audio_emb(audio_embed)
+            # print(f"audio_embed.shape after processing: {audio_embed.shape}")
         if face_embed_file:
             face_embed = torch.load(
                 os.path.join(self.face_embed_dir, face_embed_file),
@@ -140,9 +118,13 @@ class LatentDatasetAudio(Dataset):
             if not isinstance(face_embed, torch.Tensor):
                 face_embed = torch.as_tensor(face_embed)
         if face_mask_file:
-            face_mask = Image.open(os.path.join(self.face_mask_dir, face_mask_file))
-            face_mask = torch.from_numpy(np.array(face_mask))
-            print(f"face_mask.shape: {face_mask.shape}")
+            if os.path.exists(os.path.join(self.face_mask_dir, face_mask_file)):
+                face_mask = Image.open(os.path.join(self.face_mask_dir, face_mask_file))
+                face_mask = torch.from_numpy(np.array(face_mask))
+            else:
+                face_mask = torch.ones(latent.shape[2], latent.shape[3])
+                logger.warning(f"face_mask_file {face_mask_file} not found, using ones mask")
+                # print(f"face_mask.shape: {face_mask.shape}")
             # 需要将face mask的维度与latent对齐，其中，latent的维度是[16, 13, 60, 106], 分别对应[ch, t, h, w], 而face mask的维度是[480, 848], 分别对应[h, w]
             
             # 首先将face_mask转换为浮点数类型并归一化到0-1范围
@@ -173,13 +155,13 @@ class LatentDatasetAudio(Dataset):
             # 去掉批次维度，变为[ch, t, h, w]
             face_mask = face_mask.squeeze(0)
             
-            print(f"face_mask.shape after processing: {face_mask.shape}")
-            print(f"latent.shape: {latent.shape}")
-            print(f"face mask type: {type(face_mask)}, dtype: {face_mask.dtype}")
+            # print(f"face_mask.shape after processing: {face_mask.shape}")
+            # print(f"latent.shape: {latent.shape}")
+            # print(f"face mask type: {type(face_mask)}, dtype: {face_mask.dtype}")
             
             # 创建一个布尔掩码，用于标识非零元素（在计算loss时使用）
             face_mask_bool = (face_mask > 0.05).float()  # 转为0-1的浮点掩码，阈值可以调整
-            print(f"有效掩码区域占比: {face_mask_bool.sum() / face_mask_bool.numel():.4f}")
+            # print(f"有效掩码区域占比: {face_mask_bool.sum() / face_mask_bool.numel():.4f}")
             
             # 使用布尔掩码代替原始掩码
             face_mask = face_mask_bool
@@ -279,7 +261,9 @@ def latent_collate_function_audio(batch):
     if audio_embeds[0] is not None:
         # 确保是 tensor 类型
         audio_embeds = [torch.as_tensor(emb) if not isinstance(emb, torch.Tensor) else emb for emb in audio_embeds]
+        # print(f"audio_embeds.shape before stacking: {audio_embeds[0].shape}")
         audio_embeds = torch.stack(audio_embeds, dim=0)
+        # print(f"audio_embeds.shape after stacking: {audio_embeds.shape}")
     else:
         audio_embeds = None
         

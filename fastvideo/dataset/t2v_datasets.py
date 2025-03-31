@@ -152,36 +152,125 @@ class T2V_dataset(Dataset):
         try:
             assert len(frame_indices) == self.num_frames, f"frame_indices length is not equal to self.num_frames"
         except AssertionError as e:
-            import ipdb; ipdb.set_trace()
-            # raise e
+            logging.error(f"[Rank {self.gpu_rank}] AssertionError for video {video_path}: {e}. frame_indices length: {len(frame_indices)}, expected: {self.num_frames}")
+            # 可以选择返回失败字典或继续（取决于是否允许帧数不匹配）
+            # import ipdb; ipdb.set_trace() # 调试时使用
+            # 返回失败字典以跳过此样本
+            return dict(
+                pixel_values=torch.tensor([]),
+                text="",
+                input_ids=torch.tensor([]),
+                cond_mask=torch.tensor([]),
+                path=video_path,
+                timestamp=torch.tensor([]),
+                frames=torch.tensor(0),
+                face_mask_path="",
+                face_emb_path="",
+                audio_emb_path="",
+                is_processed=False # 标记未处理
+            )
+            # raise e # 如果希望程序停止
 
         ## ------new code------
-        if self.video_processor is not None or True:
+        if self.video_processor is not None or True: # 注意：这里的 or True 会导致此分支始终执行
             from pathlib import Path
             timestamp, face_mask_path, face_emb_path, audio_emb_path = self.video_processor.process(Path(video_path), self.transform,
                                          frame_indices)
             if timestamp == -1:
+                # video_processor 处理失败，返回结构一致的空字典
+                logging.warning(f"[Rank {self.gpu_rank}] video_processor failed for video: {video_path}. Skipping.")
                 return dict(
                     pixel_values=torch.tensor([]),
-                    text=torch.tensor([]),
+                    text="", # 使用空字符串
                     input_ids=torch.tensor([]),
                     cond_mask=torch.tensor([]),
-                    path=torch.tensor([]),
+                    path=video_path, # 返回路径字符串
                     timestamp=torch.tensor([]),
-                    frames=torch.tensor([]),
-                    face_mask_path=torch.tensor([]),
-                    face_emb_path=torch.tensor([]),
-                    audio_emb_path=torch.tensor([])
+                    frames=torch.tensor(0), # 返回 0 帧
+                    face_mask_path="", # 使用空字符串
+                    face_emb_path="", # 使用空字符串
+                    audio_emb_path="", # 使用空字符串
+                    is_processed=False # 标记未处理
                 )
             # 确保路径是字符串而不是Path对象
-            face_mask_path = str(face_mask_path) if face_mask_path is not None else None
-            face_emb_path = str(face_emb_path) if face_emb_path is not None else None
-            audio_emb_path = str(audio_emb_path) if audio_emb_path is not None else None
+            face_mask_path = str(face_mask_path) if face_mask_path is not None else "" # 使用空字符串代替 None
+            face_emb_path = str(face_emb_path) if face_emb_path is not None else "" # 使用空字符串代替 None
+            face_emb_path = str(face_emb_path) if face_emb_path is not None else "" # 使用空字符串代替 None
         ## ------end-----------
         
-        torchvision_video, _, metadata = torchvision.io.read_video(
-            video_path, output_format="TCHW")
-        video = torchvision_video[frame_indices]
+        try: # 添加 try-except 块来捕获视频读取错误
+            torchvision_video, _, metadata = torchvision.io.read_video(
+                video_path, pts_unit='sec', output_format="TCHW") # 建议明确 pts_unit
+        except Exception as e:
+            logging.error(f"[Rank {self.gpu_rank}] Error reading video {video_path}: {e}. Skipping.")
+            # 视频读取失败，返回结构一致的空字典
+            return dict(
+                pixel_values=torch.tensor([]),
+                text="",
+                input_ids=torch.tensor([]),
+                cond_mask=torch.tensor([]),
+                path=video_path,
+                timestamp=torch.tensor([]),
+                frames=torch.tensor(0),
+                face_mask_path="",
+                face_emb_path="",
+                audio_emb_path="",
+                is_processed=False # 标记未处理
+            )
+
+        # --- 新增检查 ---
+        if torchvision_video.shape[0] == 0:
+            logging.warning(f"[Rank {self.gpu_rank}] Failed to read video or video is empty: {video_path}. Skipping.")
+            # 视频为空，返回结构一致的空字典
+            return dict(
+                pixel_values=torch.tensor([]),
+                text="",
+                input_ids=torch.tensor([]),
+                cond_mask=torch.tensor([]),
+                path=video_path,
+                timestamp=torch.tensor([]),
+                frames=torch.tensor(0),
+                face_mask_path="",
+                face_emb_path="",
+                audio_emb_path="",
+                is_processed=False # 标记未处理
+            )
+        # --- 结束新增检查 ---
+
+        try: # 添加 try-except 块来捕获索引错误 (虽然前面的检查应该能避免，但以防万一)
+            video = torchvision_video[frame_indices]
+        except IndexError as e:
+            logging.error(f"[Rank {self.gpu_rank}] IndexError when accessing frames for video {video_path}: {e}. Video shape: {torchvision_video.shape}, Indices length: {len(frame_indices)}. Skipping.")
+             # 索引失败，返回结构一致的空字典
+            return dict(
+                pixel_values=torch.tensor([]),
+                text="",
+                input_ids=torch.tensor([]),
+                cond_mask=torch.tensor([]),
+                path=video_path,
+                timestamp=torch.tensor([]),
+                frames=torch.tensor(0),
+                face_mask_path="",
+                face_emb_path="",
+                audio_emb_path="",
+                is_processed=False # 标记未处理
+            )
+        except Exception as e: # 捕获其他可能的错误
+            logging.error(f"[Rank {self.gpu_rank}] Unexpected error processing video {video_path} after reading: {e}. Skipping.")
+            return dict(
+                pixel_values=torch.tensor([]),
+                text="",
+                input_ids=torch.tensor([]),
+                cond_mask=torch.tensor([]),
+                path=video_path,
+                timestamp=torch.tensor([]),
+                frames=torch.tensor(0),
+                face_mask_path="",
+                face_emb_path="",
+                audio_emb_path="",
+                is_processed=False # 标记未处理
+            )
+
         video = self.transform(video)
         video = rearrange(video, "t c h w -> c t h w")
         video = video.to(torch.uint8)
@@ -224,6 +313,7 @@ class T2V_dataset(Dataset):
             face_mask_path=face_mask_path,  # new
             face_emb_path=face_emb_path,    # new
             audio_emb_path=audio_emb_path,  # new
+            is_processed=False # 标记未处理 (因为这是实时处理的)
         )
         
     def set_checkpoint(self, n_used_elements):
