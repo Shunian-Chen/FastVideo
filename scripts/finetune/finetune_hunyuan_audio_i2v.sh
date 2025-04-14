@@ -8,25 +8,48 @@ nproc_per_node=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 sp_size=1
 
 DATA_NAME="252_hour_test_480p_49frames"
-EXPERIMENT_NAME="Hunyuan-Audio-Finetune-Hunyuan-audio-only-49frames-${DATA_NAME}"
+EXPERIMENT_NAME="Hunyuan-Audio-Finetune-Hunyuan-ai2v-49frames-${DATA_NAME}"
 LOG_DIR="./logs/model_training/${EXPERIMENT_NAME}.log"
 OUTPUT_DIR="./data/outputs/${EXPERIMENT_NAME}"
 mkdir -p $(dirname $LOG_DIR)
 mkdir -p $(dirname $OUTPUT_DIR)
 
+te_params=" \
+    --vae-model-name-or-path /data/nas/yexin/workspace/shunian/model/ \
+    --vae-precision fp16 \
+    --text-encoder llm-i2v \
+    --text-encoder-precision fp16 \
+    --text-states-dim 4096 \
+    --text-len 256 \
+    --tokenizer llm-i2v \
+    --prompt-template dit-llm-encode-i2v \
+    --prompt-template-video dit-llm-encode-video-i2v \
+    --hidden-state-skip-layer 2 \
+    --text-encoder-2 clipL \
+    --text-encoder-precision-2 fp16 \
+    --text-states-dim-2 768 \
+    --tokenizer-2 clipL \
+    --text-len-2 77 \
+    --i2v-mode \
+    --reproduce \
+    "
+
 # echo "启动训练，只训练音频相关参数..."
 
+export MODEL_BASE="/data/nas/yexin/workspace/shunian/model"
+
 torchrun --nnodes 1 --nproc_per_node $nproc_per_node \
-    fastvideo/train_audio.py \
+    --master_port 29509 \
+    fastvideo/train_audio_i2v.py \
     --seed 42 \
     --pretrained_model_name_or_path /sds_wangby/models/HunyuanVideo/HunyuanVideo \
-    --dit_model_name_or_path /data/nas/yexin/workspace/shunian/model/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt\
-    --model_type "hunyuan_audio" \
+    --dit_model_name_or_path ${MODEL_BASE}/hunyuan-video-i2v-720p/transformers/mp_rank_00_model_states.pt\
+    --model_type "hunyuan_audio_i2v" \
     --cache_dir data/.cache \
     --data_json_path data/${DATA_NAME}/videos2caption.json \
     --validation_prompt_dir data/Image-Vid-Finetune-HunYuan/validation \
     --gradient_checkpointing \
-    --train_batch_size=2 \
+    --train_batch_size=1 \
     --num_latent_t 32 \
     --sp_size $sp_size \
     --train_sp_batch_size 1 \
@@ -53,4 +76,5 @@ torchrun --nnodes 1 --nproc_per_node $nproc_per_node \
     --validation_guidance_scale "1.0" \
     --master_weight_type bf16 \
     --train_audio_only \
+    ${te_params} \
     > ${LOG_DIR} 2>&1

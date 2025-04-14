@@ -6,7 +6,7 @@ import logging
 from collections import Counter
 from os.path import join as opj
 from pathlib import Path
-
+from tqdm import tqdm
 import numpy as np
 import torch
 import torchvision
@@ -540,7 +540,7 @@ class T2V_dataset(Dataset):
                 i.strip().split(",") for i in f.readlines()
                 if len(i.strip()) > 0
             ]
-        print(folder_anno)
+        # print(folder_anno)
         for folder, anno in folder_anno:
             with open(anno, "r") as f:
                 sub_list = json.load(f)
@@ -559,7 +559,7 @@ class T2V_dataset(Dataset):
             
             logging.info(f"[Rank {self.gpu_rank}] 开始检查已处理的样本，原始样本数量: {len(cap_lists)}")
             
-            for item in cap_lists:
+            for item in tqdm(cap_lists, desc=f"[Rank {self.gpu_rank}] 检查已处理的样本"):
                 video_path = item["path"]
                 video_name = os.path.basename(video_path).split(".")[0]
                 
@@ -576,13 +576,13 @@ class T2V_dataset(Dataset):
                 
                 # 检查所有文件是否都存在
                 latent_exists = os.path.exists(latent_path)
-                face_mask_exists = os.path.exists(face_mask_path)
-                face_emb_exists = os.path.exists(face_emb_path)
+                # face_mask_exists = os.path.exists(face_mask_path)
+                # face_emb_exists = os.path.exists(face_emb_path)
                 audio_emb_exists = os.path.exists(audio_emb_path)
                 
-                all_exist = (latent_exists and face_mask_exists and 
-                            face_emb_exists and audio_emb_exists)
-                
+                # all_exist = (latent_exists and face_mask_exists and 
+                            # face_emb_exists and audio_emb_exists)
+                all_exist = latent_exists and audio_emb_exists
                 # 如果所有文件都存在，则标记该样本为已处理
                 if all_exist:
                     processed_count += 1
@@ -615,10 +615,10 @@ class T2V_dataset(Dataset):
                     missing_files = []
                     if not latent_exists:
                         missing_files.append("latent")
-                    if not face_mask_exists:
-                        missing_files.append("face_mask")
-                    if not face_emb_exists:
-                        missing_files.append("face_emb")
+                    # if not face_mask_exists:
+                    #     missing_files.append("face_mask")
+                    # if not face_emb_exists:
+                    #     missing_files.append("face_emb")
                     if not audio_emb_exists:
                         missing_files.append("audio_emb")
                     

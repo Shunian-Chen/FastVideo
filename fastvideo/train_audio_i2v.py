@@ -9,7 +9,7 @@ import json
 import datetime
 from collections import deque
 import numpy as np
-
+import torch.multiprocessing as mp
 import torch
 import torch.distributed as dist
 import wandb
@@ -27,6 +27,8 @@ from fastvideo.dataset.latent_datasets import (LatentDataset,
                                                latent_collate_function)
 from fastvideo.dataset.latent_datasets_audio import (LatentDatasetAudio,
                                                      latent_collate_function_audio)
+from fastvideo.dataset.latent_datasets_audio_i2v import (LatentDatasetAudio_i2v,
+                                                     latent_collate_function_audio_i2v)
 from fastvideo.models.mochi_hf.mochi_latents_utils import normalize_dit_input
 from fastvideo.models.mochi_hf.pipeline_mochi import MochiPipeline
 from fastvideo.models.hunyuan_hf.pipeline_hunyuan import HunyuanVideoPipeline
@@ -35,7 +37,8 @@ from fastvideo.utils.checkpoint import (resume_lora_optimizer, save_checkpoint,
                                         save_lora_checkpoint)
 from fastvideo.utils.communications import (broadcast,
                                             sp_parallel_dataloader_wrapper,
-                                            sp_parallel_dataloader_wrapper_audio)
+                                            sp_parallel_dataloader_wrapper_audio,
+                                            sp_parallel_dataloader_wrapper_audio_i2v)
 from fastvideo.utils.dataset_utils import LengthGroupedSampler
 from fastvideo.utils.fsdp_util import (apply_fsdp_checkpointing,
                                        get_dit_fsdp_kwargs)
@@ -47,6 +50,10 @@ from fastvideo.utils.parallel_states import (destroy_sequence_parallel_group,
                                              )
 from fastvideo.utils.validation import log_validation
 from loguru import logger
+from fastvideo.utils.load import load_vae
+
+from fastvideo.models.hunyuan.constants import *
+from fastvideo.models.hunyuan.text_encoder import TextEncoder_i2v
 
 
 import sys
@@ -56,189 +63,6 @@ logger.add(sys.stdout, level="WARNING")
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.31.0")
-
-
-class AnomalyDetector:
-    def __init__(self, 
-                 output_dir,
-                 rank,
-                 window_size=50, 
-                 loss_threshold_factor=3.0, 
-                 grad_norm_threshold_factor=3.0,
-                 fixed_loss_threshold=None,
-                 fixed_grad_norm_threshold=None):
-        """
-        初始化异常检测器
-        
-        参数:
-            output_dir: 输出目录
-            rank: 进程ID
-            window_size: 滑动窗口大小
-            loss_threshold_factor: 损失阈值因子 (均值 + factor * 标准差)
-            grad_norm_threshold_factor: 梯度范数阈值因子
-            fixed_loss_threshold: 固定损失阈值，若设置则覆盖动态阈值
-            fixed_grad_norm_threshold: 固定梯度范数阈值，若设置则覆盖动态阈值
-        """
-        self.output_dir = output_dir
-        self.rank = rank
-        self.window_size = window_size
-        self.loss_threshold_factor = loss_threshold_factor
-        self.grad_norm_threshold_factor = grad_norm_threshold_factor
-        self.fixed_loss_threshold = fixed_loss_threshold
-        self.fixed_grad_norm_threshold = fixed_grad_norm_threshold
-        
-        # 创建输出目录
-        self.anomaly_dir = os.path.join(output_dir, "anomalies")
-        self.anomaly_data_dir = os.path.join(self.anomaly_dir, "data")
-        os.makedirs(self.anomaly_dir, exist_ok=True)
-        os.makedirs(self.anomaly_data_dir, exist_ok=True)
-        
-        # 初始化滑动窗口
-        self.loss_window = deque(maxlen=window_size)
-        self.grad_norm_window = deque(maxlen=window_size)
-        
-        # 初始化JSONL文件
-        self.jsonl_path = os.path.join(self.anomaly_dir, f"anomalies_rank_{rank}.jsonl")
-        
-    def update(self, loss, grad_norm):
-        """更新滑动窗口"""
-        self.loss_window.append(loss)
-        self.grad_norm_window.append(grad_norm)
-        
-    def is_anomaly(self, loss, grad_norm):
-        """检测当前值是否为异常"""
-        # 如果窗口未满一半，不检测异常
-        if len(self.loss_window) < self.window_size // 4:  # 从window_size // 2改为window_size // 4，更早开始检测
-            return False, {}
-        
-        # 计算动态阈值（使用中位数而不是均值，更加鲁棒）
-        loss_list = list(self.loss_window)
-        grad_norm_list = list(self.grad_norm_window)
-        
-        # 计算中位数 - 比均值更鲁棒，不受极端值影响
-        loss_median = float(np.median(loss_list))
-        grad_norm_median = float(np.median(grad_norm_list))
-        
-        # 计算MAD（中位数绝对偏差）- 比标准差更鲁棒
-        loss_mad = float(np.median(np.abs(np.array(loss_list) - loss_median)))
-        grad_norm_mad = float(np.median(np.abs(np.array(grad_norm_list) - grad_norm_median)))
-        
-        # 当MAD为0时（例如多个相同的值），使用标准差的备选方案
-        if loss_mad == 0:
-            loss_mad = float(np.std(loss_list))
-        if grad_norm_mad == 0:
-            grad_norm_mad = float(np.std(grad_norm_list))
-        
-        # 动态阈值（基于中位数和MAD）
-        # 通常MAD的系数要比标准差的系数大，因为MAD通常小于标准差
-        # MAD系数 = 标准差系数 * 1.4826（正态分布下MAD与标准差的关系）
-        mad_factor = self.loss_threshold_factor * 1.4826
-        
-        loss_threshold = self.fixed_loss_threshold if self.fixed_loss_threshold is not None else \
-                        (loss_median + mad_factor * loss_mad)
-        grad_norm_threshold = self.fixed_grad_norm_threshold if self.fixed_grad_norm_threshold is not None else \
-                             (grad_norm_median + mad_factor * grad_norm_mad)
-        
-        # 为了参考，仍然计算均值和标准差
-        loss_mean = float(np.mean(loss_list))
-        loss_std = float(np.std(loss_list))
-        grad_norm_mean = float(np.mean(grad_norm_list))
-        grad_norm_std = float(np.std(grad_norm_list))
-        
-        # 检测异常：除了标准偏差外，还检测相对于均值的突变
-        is_loss_anomaly = loss > loss_threshold
-        is_grad_anomaly = grad_norm > grad_norm_threshold
-        
-        # 增加相对变化率检测：如果当前值比前一个时间步的值突然增加过多
-        relative_loss_change = 0
-        relative_grad_change = 0
-        if len(self.loss_window) > 1:
-            prev_loss = self.loss_window[-1]
-            if prev_loss > 0:
-                relative_loss_change = (loss - prev_loss) / prev_loss
-            
-            prev_grad = self.grad_norm_window[-1]
-            if prev_grad > 0:
-                relative_grad_change = (grad_norm - prev_grad) / prev_grad
-        
-        # 如果相对变化率超过50%，也认为是异常
-        is_loss_spike = relative_loss_change > 0.5
-        is_grad_spike = relative_grad_change > 0.5
-        
-        threshold_info = {
-            "loss_median": loss_median,
-            "loss_mad": loss_mad,
-            "loss_threshold": float(loss_threshold),
-            "grad_norm_median": grad_norm_median,
-            "grad_norm_mad": grad_norm_mad,
-            "grad_norm_threshold": float(grad_norm_threshold),
-            "loss_mean": loss_mean,  # 保留均值和标准差以便参考
-            "loss_std": loss_std,
-            "grad_norm_mean": grad_norm_mean,
-            "grad_norm_std": grad_norm_std,
-            "relative_loss_change": float(relative_loss_change),
-            "relative_grad_change": float(relative_grad_change)
-        }
-        
-        # 任一条件满足即为异常
-        return (is_loss_anomaly or is_grad_anomaly or is_loss_spike or is_grad_spike), threshold_info
-    
-    def save_batch_data(self, step, batch_data):
-        """保存批次数据"""
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        data_dir = os.path.join(self.anomaly_data_dir, f"step_{step}_rank_{self.rank}_{timestamp}")
-        os.makedirs(data_dir, exist_ok=True)
-        
-        batch_info = {}
-        
-        # 保存各种张量数据
-        for key, value in batch_data.items():
-            if isinstance(value, torch.Tensor):
-                file_path = os.path.join(data_dir, f"{key}.pt")
-                torch.save(value, file_path)
-                batch_info[f"{key}_shape"] = list(value.shape)
-                batch_info[f"{key}_path"] = os.path.relpath(file_path, self.output_dir)
-            elif isinstance(value, list) and value and isinstance(value[0], str):
-                # 假设是文件路径列表
-                batch_info[f"{key}"] = value
-            else:
-                # 其他类型的数据直接添加到info中
-                try:
-                    json.dumps({key: value})  # 测试是否可JSON序列化
-                    batch_info[key] = value
-                except:
-                    batch_info[key] = str(value)
-        
-        return data_dir, batch_info
-    
-    def log_anomaly(self, step, loss, grad_norm, batch_data, checkpoint_path=None):
-        """记录异常"""
-        # 检查是否为异常
-        is_anomaly, threshold_info = self.is_anomaly(loss, grad_norm)
-        if not is_anomaly:
-            return False
-        
-        # 保存批次数据
-        data_dir, batch_info = self.save_batch_data(step, batch_data)
-        
-        # 记录异常信息
-        anomaly_info = {
-            "step": step,
-            "rank": self.rank,
-            "timestamp": datetime.datetime.now().isoformat(),
-            "loss": float(loss),
-            "grad_norm": float(grad_norm),
-            "batch_info": batch_info,
-            "model_checkpoint": checkpoint_path,
-            "threshold_info": threshold_info,
-            "data_dir": os.path.relpath(data_dir, self.output_dir)
-        }
-        
-        # 写入JSONL文件
-        with open(self.jsonl_path, "a") as f:
-            f.write(json.dumps(anomaly_info) + "\n")
-        
-        return True
 
 
 def compute_density_for_timestep_sampling(
@@ -313,7 +137,20 @@ def train_one_step(
     for _ in range(gradient_accumulation_steps):
         audio_embeds = None
         face_embeds = None
-        if "audio" in model_type:
+        cond_latents = None
+        if "audio_i2v" in model_type:
+            (
+                latents,
+                encoder_hidden_states,
+                latents_attention_mask,
+                encoder_attention_mask,
+                audio_embeds,
+                face_embeds,
+                face_mask,
+                audio_embed_file,
+                cond_latents,
+            ) = next(loader)
+        elif "audio" in model_type:
             (
                 latents,
                 encoder_hidden_states,
@@ -358,6 +195,11 @@ def train_one_step(
             dtype=latents.dtype,
         )
         noisy_model_input = (1.0 - sigmas) * latents + sigmas * noise
+
+        if "audio_i2v" in model_type:
+            # replace the first frame of the latent with the cond_latents
+            noisy_model_input = torch.concat([cond_latents, noisy_model_input[:, :, 1:, :, :]], dim=2)
+
         with torch.autocast("cuda", dtype=torch.bfloat16):
             input_kwargs = {
                 "hidden_states": noisy_model_input,
@@ -378,9 +220,15 @@ def train_one_step(
         if precondition_outputs:
             model_pred = noisy_model_input - model_pred * sigmas
         if precondition_outputs:
-            target = latents
+            if "audio_i2v" in model_type:
+                target = torch.concat([cond_latents, latents[:, :, 1:, :, :]], dim=2)
+            else:
+                target = latents
         else:
-            target = noise - latents
+            if "audio_i2v" in model_type:
+                target = torch.concat([cond_latents, noise - latents[:, :, 1:, :, :]], dim=2)
+            else:
+                target = noise - latents
         # print(f"model_pred.shape: {model_pred.shape}, target.shape: {target.shape}")
         # print(f"face_mask.shape: {face_mask.shape}")
         # 根据face_mask，将model_pred和target中face_mask为0的部分设置为0
@@ -423,19 +271,89 @@ def main(args):
     if rank <= 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    # 初始化异常检测器
-    anomaly_detector = AnomalyDetector(
-        output_dir=args.output_dir,
-        rank=rank,
-        window_size=50,
-        loss_threshold_factor=2.0,     # 从3.0降低到2.0，使其更容易捕获波动
-        grad_norm_threshold_factor=2.0, # 从3.0降低到2.0，使其更容易捕获波动
-        fixed_loss_threshold=0.3,      # 从0.5降低到0.3，降低固定阈值
-        fixed_grad_norm_threshold=1.0   # 从1.5降低到1.0，降低固定阈值
-    )
-
     # For mixed precision training we cast all non-trainable weights to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
+
+    # 加载vae
+    main_print(f"--> loading vae from {args.vae_model_name_or_path}")
+    vae, autocast_type, fps = load_vae(args.model_type, args.vae_model_name_or_path)
+    vae = vae.to(device)
+    vae.enable_tiling()
+
+    if args.i2v_mode:
+        image_embed_interleave = 4
+    else:
+        image_embed_interleave = 1
+
+    text_encoder = TextEncoder_i2v(
+            text_encoder_type=args.text_encoder,
+            max_length=args.text_len
+            + (
+                PROMPT_TEMPLATE[args.prompt_template_video].get("crop_start", 0)
+                if args.prompt_template_video is not None
+                else PROMPT_TEMPLATE[args.prompt_template].get("crop_start", 0)
+                if args.prompt_template is not None
+                else 0
+            ),
+            text_encoder_precision=args.text_encoder_precision,
+            tokenizer_type=args.tokenizer,
+            i2v_mode=args.i2v_mode,
+            prompt_template=(
+                PROMPT_TEMPLATE[args.prompt_template]
+                if args.prompt_template is not None
+                else None
+            ),
+            prompt_template_video=(
+                PROMPT_TEMPLATE[args.prompt_template_video]
+                if args.prompt_template_video is not None
+                else None
+            ),
+            hidden_state_skip_layer=args.hidden_state_skip_layer,
+            apply_final_norm=args.apply_final_norm,
+            reproduce=args.reproduce,
+            logger=logger,
+            device=device,
+            image_embed_interleave=image_embed_interleave
+        )
+
+    if "audio" in args.model_type:
+        if "i2v" in args.model_type:
+            train_dataset = LatentDatasetAudio_i2v(args.data_json_path, args.num_latent_t,
+                                  args.cfg, vae, text_encoder, args)
+            collate_fn = latent_collate_function_audio_i2v
+        else:
+            train_dataset = LatentDatasetAudio(args.data_json_path, args.num_latent_t,
+                                  args.cfg)
+            collate_fn = latent_collate_function_audio
+    else:
+        train_dataset = LatentDataset(args.data_json_path, args.num_latent_t,
+                                  args.cfg)
+        collate_fn = latent_collate_function
+    sampler = (LengthGroupedSampler(
+        args.train_batch_size,
+        rank=rank,
+        world_size=world_size,
+        lengths=train_dataset.lengths,
+        group_frame=args.group_frame,
+        group_resolution=args.group_resolution,
+    ) if (args.group_frame or args.group_resolution) else DistributedSampler(
+        train_dataset, rank=rank, num_replicas=world_size, shuffle=False))
+
+    if "audio_i2v" in args.model_type:
+        collate_fn = latent_collate_function_audio_i2v
+    elif "audio" in args.model_type:
+        collate_fn = latent_collate_function_audio
+    else:
+        collate_fn = latent_collate_function
+    train_dataloader = DataLoader(
+        train_dataset,
+        sampler=sampler,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+        drop_last=True,
+    )
 
     # Create model:
 
@@ -577,33 +495,6 @@ def main(args):
         last_epoch=init_steps - 1,
     )
 
-    if "audio" in args.model_type:
-        train_dataset = LatentDatasetAudio(args.data_json_path, args.num_latent_t,
-                                  args.cfg)
-        collate_fn = latent_collate_function_audio
-    else:
-        train_dataset = LatentDataset(args.data_json_path, args.num_latent_t,
-                                  args.cfg)
-        collate_fn = latent_collate_function
-    sampler = (LengthGroupedSampler(
-        args.train_batch_size,
-        rank=rank,
-        world_size=world_size,
-        lengths=train_dataset.lengths,
-        group_frame=args.group_frame,
-        group_resolution=args.group_resolution,
-    ) if (args.group_frame or args.group_resolution) else DistributedSampler(
-        train_dataset, rank=rank, num_replicas=world_size, shuffle=False))
-
-    train_dataloader = DataLoader(
-        train_dataset,
-        sampler=sampler,
-        collate_fn=latent_collate_function_audio if "audio" in args.model_type else latent_collate_function,
-        pin_memory=True,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-        drop_last=True,
-    )
 
     num_update_steps_per_epoch = math.ceil(
         len(train_dataloader) / args.gradient_accumulation_steps *
@@ -652,7 +543,15 @@ def main(args):
         disable=local_rank > 0,
     )
 
-    if "audio" in args.model_type:
+    if "audio_i2v" in args.model_type:
+        loader = sp_parallel_dataloader_wrapper_audio_i2v(
+            train_dataloader,
+            device,
+            args.train_batch_size,
+            args.sp_size,
+            args.train_sp_batch_size,
+        )
+    elif "audio" in args.model_type:
         loader = sp_parallel_dataloader_wrapper_audio(
             train_dataloader,
             device,
@@ -704,8 +603,6 @@ def main(args):
         })
         progress_bar.update(1)
         
-        # 更新异常检测器并检查是否有异常
-        anomaly_detector.update(loss, grad_norm)
         
         # 获取最新的检查点路径
         latest_checkpoint = None
@@ -714,17 +611,6 @@ def main(args):
             latest_checkpoint = os.path.join(args.output_dir, f"checkpoint-{checkpoint_step}")
             if not os.path.exists(latest_checkpoint):
                 latest_checkpoint = None
-        
-        # # 记录异常
-        # is_anomaly = anomaly_detector.log_anomaly(
-        #     step=step,
-        #     loss=loss,
-        #     grad_norm=grad_norm,
-        #     checkpoint_path=latest_checkpoint
-        # )
-        
-        # if is_anomaly:
-        #     main_print(f"Rank {rank}, Step {step}: Detected anomaly, loss={loss:.4f}, grad_norm={grad_norm:.4f}")
         
         if rank <= 0:
             wandb.log(
@@ -764,6 +650,135 @@ def main(args):
     if get_sequence_parallel_state():
         destroy_sequence_parallel_group()
 
+def add_extra_models_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(
+        title="Extra models args, including vae, text encoders and tokenizers)"
+    )
+
+    group.add_argument(
+        "--vae-model-name-or-path",
+        type=str,
+        default=None,
+        help="Path to the vae model.",
+    )
+
+    group.add_argument(
+        "--vae-precision",
+        type=str,
+        default="fp16",
+        choices=PRECISIONS,
+        help="Precision mode for the vae model.",
+    )
+
+    group.add_argument(
+        "--sematic-cond-drop-p",
+        type=float,
+        default=0.1,
+        help="Drop probability for the semantic condition."
+    )
+
+    group.add_argument(
+        "--i2v-mode",
+        action="store_true",
+        help="Whether to open i2v mode."
+    )
+    group.add_argument(
+        "--reproduce",
+        action="store_true",
+        help="Whether to reproduce the training."
+    )
+    group.add_argument(
+        "--text-encoder",
+        type=str,
+        default="llm-i2v",
+        choices=list(TEXT_ENCODER_PATH),
+        help="Name of the text encoder model.",
+    )
+    group.add_argument(
+        "--text-encoder-precision",
+        type=str,
+        default="fp16",
+        choices=PRECISIONS,
+        help="Precision mode for the text encoder model.",
+    )
+    group.add_argument(
+        "--text-states-dim",
+        type=int,
+        default=4096,
+        help="Dimension of the text encoder hidden states.",
+    )
+    group.add_argument(
+        "--text-len", type=int, default=256, help="Maximum length of the text input."
+    )
+    group.add_argument(
+        "--tokenizer",
+        type=str,
+        default="llm-i2v",
+        choices=list(TOKENIZER_PATH),
+        help="Name of the tokenizer model.",
+    )
+    group.add_argument(
+        "--prompt-template",
+        type=str,
+        default="dit-llm-encode-i2v",
+        choices=PROMPT_TEMPLATE,
+        help="Image prompt template for the decoder-only text encoder model.",
+    )
+    group.add_argument(
+        "--prompt-template-video",
+        type=str,
+        default="dit-llm-encode-video-i2v",
+        choices=PROMPT_TEMPLATE,
+        help="Video prompt template for the decoder-only text encoder model.",
+    )
+    group.add_argument(
+        "--hidden-state-skip-layer",
+        type=int,
+        default=2,
+        help="Skip layer for hidden states.",
+    )
+    group.add_argument(
+        "--apply-final-norm",
+        action="store_true",
+        help="Apply final normalization to the used text encoder hidden states.",
+    )
+
+    # - CLIP
+    group.add_argument(
+        "--text-encoder-2",
+        type=str,
+        default="clipL",
+        choices=list(TEXT_ENCODER_PATH),
+        help="Name of the second text encoder model.",
+    )
+    group.add_argument(
+        "--text-encoder-precision-2",
+        type=str,
+        default="fp16",
+        choices=PRECISIONS,
+        help="Precision mode for the second text encoder model.",
+    )
+    group.add_argument(
+        "--text-states-dim-2",
+        type=int,
+        default=768,
+        help="Dimension of the second text encoder hidden states.",
+    )
+    group.add_argument(
+        "--tokenizer-2",
+        type=str,
+        default="clipL",
+        choices=list(TOKENIZER_PATH),
+        help="Name of the second tokenizer model.",
+    )
+    group.add_argument(
+        "--text-len-2",
+        type=int,
+        default=77,
+        help="Maximum length of the second text input.",
+    )
+
+    return parser
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -1050,6 +1065,8 @@ if __name__ == "__main__":
         action="store_true",
         help="只训练与音频相关的参数",
     )
+
+    parser = add_extra_models_args(parser)
 
     args = parser.parse_args()
     main(args)

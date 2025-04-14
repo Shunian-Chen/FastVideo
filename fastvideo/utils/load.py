@@ -363,7 +363,7 @@ def load_transformer(
                                               dit_model_name_or_path)
         if master_weight_type == torch.bfloat16:
             transformer = transformer.bfloat16()
-    elif model_type == "hunyuan_audio":
+    elif model_type == "hunyuan_audio" or model_type == "hunyuan_audio_i2v":
         transformer = HYVideoDiffusionTransformerAudio(
             in_channels=16,
             out_channels=16,
@@ -395,7 +395,7 @@ def load_vae(model_type, pretrained_model_name_or_path):
             torch_dtype=weight_dtype)
         autocast_type = torch.bfloat16
         fps = 24
-    elif model_type == "hunyuan" or model_type == "hunyuan_audio":
+    elif model_type == "hunyuan" or model_type == "hunyuan_audio" or model_type == "hunyuan_audio_i2v":
         vae_precision = torch.float32
         vae_path = os.path.join(pretrained_model_name_or_path,
                                 "hunyuan-video-t2v-720p/vae")

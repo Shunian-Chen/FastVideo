@@ -9,6 +9,12 @@ from loguru import logger
 import sys
 from PIL import Image
 import numpy as np
+from fastvideo.models.hunyuan.constants import PROMPT_TEMPLATE, PRECISION_TO_TYPE
+import torchvision.transforms as transforms
+from typing import List
+import PIL
+
+
 ## 不显示info级别的日志
 logger.remove()
 logger.add(sys.stdout, level="WARNING")
@@ -18,13 +24,132 @@ BACKGROUND_VALUE = 0.1
 FACE_MASK_VALUE = 0.5
 LIP_MASK_VALUE = 1.0
 
-class LatentDatasetAudio(Dataset):
+def numpy_to_pil(images: np.ndarray) -> List[PIL.Image.Image]:
+    if images.ndim == 3:
+        images = images[None, ...]
+    images = (images * 255).round().astype("uint8")
+    if images.shape[-1] == 1:
+        # special case for grayscale (single channel) images
+        pil_images = [Image.fromarray(image.squeeze(), mode="L") for image in images]
+    else:
+        pil_images = [Image.fromarray(image) for image in images]
+
+    return pil_images
+
+def black_image(width, height):
+    black_image = Image.new("RGB", (width, height), (0, 0, 0))
+    return black_image
+
+def get_cond_images(args, latents, vae, is_uncond=False):
+    """get conditioned images by decode the first frame latents"""
+    if len(latents.shape) == 5:
+        sematic_image_latents = latents[:, :, 0, ...]
+        sematic_image_latents = sematic_image_latents.unsqueeze(2).to(vae.dtype)
+    elif len(latents.shape) == 4:
+        sematic_image_latents = latents[:, 0, ...]
+        sematic_image_latents = sematic_image_latents.unsqueeze(1).to(vae.dtype)
+        sematic_image_latents = sematic_image_latents.unsqueeze(0).to(vae.dtype)
+
+    else: 
+        sematic_image_latents = latents
+    sematic_image_latents = 1 / vae.config.scaling_factor * sematic_image_latents.to(vae.device)
+
+    print(f"sematic_image_latents device: {sematic_image_latents.device}")
+    print(f"vae device: {vae.device}")
+    semantic_images = vae.decode(
+        sematic_image_latents, return_dict=False
+    )[0]
+
+    semantic_images = semantic_images.squeeze(2)
+    semantic_images = (semantic_images / 2 + 0.5).clamp(0, 1)
+    semantic_images = semantic_images.cpu().permute(0, 2, 3, 1).float().numpy()
+    # print(f"semantic image shape: {semantic_images.shape}")
+
+    semantic_images = numpy_to_pil(semantic_images)
+    if is_uncond:
+        semantic_images = [
+            black_image(img.size[0], img.size[1]) for img in semantic_images
+        ]
+
+    # 将semantic_images以png的格式保存到指定路径
+    for i, img in enumerate(semantic_images):
+        img.save(os.path.join("/data/nas/yexin/workspace/shunian/model_training/FastVideo/outputs_video", f"semantic_images_{i}.png"))
+    return semantic_images
+
+def get_cond_latents(args, latents, vae):
+    """get conditioned latent by decode and encode the first frame latents"""
+    if len(latents.shape) == 5:
+        first_image_latents = latents[:, :, 0, ...]  
+        first_image_latents = first_image_latents.unsqueeze(2).to(vae.dtype)
+    elif len(latents.shape) == 4:
+        first_image_latents = latents[:, 0, ...]  
+        first_image_latents = first_image_latents.unsqueeze(1).to(vae.dtype)
+        first_image_latents = first_image_latents.unsqueeze(0).to(vae.dtype)
+
+    else: 
+        first_image_latents = latents
+    
+    # breakpoint()
+    print(f"first_image_latents device before: {first_image_latents.device}")
+    print(f"vae device before: {vae.device}")
+    first_image_latents = 1 / vae.config.scaling_factor * first_image_latents.to(vae.device)
+
+    # print(f"latents shape: {latents.shape}, dtype: {latents.dtype}")
+    # print(f"first image latents shape: {first_image_latents.shape}, dtype: {first_image_latents.dtype}")
+    # print(f"first image latents shape after unsqueeze: {first_image_latents.unsqueeze(1).shape}, dtype: {first_image_latents.unsqueeze(2).dtype}")
+
+    print(f"first_image_latents device: {first_image_latents.device}")
+    print(f"vae device: {vae.device}")
+    first_images = vae.decode(
+        first_image_latents, return_dict=False
+    )[0]
+
+    if len(first_images.shape) == 5:
+        first_images = first_images.squeeze(2)
+    elif len(first_images.shape) == 4:
+        first_images = first_images.squeeze(1)
+    
+    print(f"first image shape: {first_images.shape}, dtype: {first_images.dtype}")
+    first_images = (first_images / 2 + 0.5).clamp(0, 1)
+    first_images = first_images.cpu().permute(0, 2, 3, 1).float().numpy()
+    first_images = numpy_to_pil(first_images)
+
+    # 将first_images以png的格式保存到指定路径
+    for i, img in enumerate(first_images):
+        img.save(os.path.join("/data/nas/yexin/workspace/shunian/model_training/FastVideo/outputs_video", f"first_images_{i}.png"))
+
+    image_transform = transforms.Compose(
+        [transforms.ToTensor(), transforms.Normalize([0.5], [0.5])]
+    )
+    first_images_pixel_values = [image_transform(image) for image in first_images]
+    first_images_pixel_values = (
+        torch.cat(first_images_pixel_values).unsqueeze(0).unsqueeze(2).to(vae.device)
+    )
+    print(f"first_images_pixel_values shape: {first_images_pixel_values.shape}, dtype: {first_images_pixel_values.dtype}")
+    vae_dtype = PRECISION_TO_TYPE[args.vae_precision]
+    with torch.autocast(
+        device_type="cuda", dtype=vae_dtype, enabled=vae_dtype != torch.float32
+    ):
+        cond_latents = vae.encode(
+            first_images_pixel_values
+        ).latent_dist.sample()  # B, C, F, H, W
+        cond_latents.mul_(vae.config.scaling_factor)
+        cond_latents = cond_latents.squeeze(0)
+
+
+    print(f"cond_latents shape: {cond_latents.shape}, dtype: {cond_latents.dtype}")
+    return cond_latents
+
+class LatentDatasetAudio_i2v(Dataset):
 
     def __init__(
         self,
         json_path,
         num_latent_t,
         cfg_rate,
+        vae,
+        text_encoder,
+        args,
     ):
         # data_merge_path: video_dir, latent_dir, prompt_embed_dir, json_path
         self.json_path = json_path
@@ -54,6 +179,28 @@ class LatentDatasetAudio(Dataset):
             for data_item in self.data_anno
         ]
 
+        self.text_encoder = text_encoder
+
+        self.vae = vae
+        self.args = args
+
+    @staticmethod
+    def get_text_tokens(text_encoder, description):
+        text_inputs = text_encoder.text2tokens(description, data_type='video')
+        text_ids = text_inputs["input_ids"]
+        text_mask = text_inputs["attention_mask"]
+        return text_ids, text_mask
+
+    def get_text_hidden_states(self, text_encoder, text_ids, text_mask, semantic_images):
+        text_outputs = text_encoder.encode(
+                {"input_ids": text_ids, "attention_mask": text_mask},
+                data_type="video",
+                semantic_images=semantic_images,
+            )
+        text_states = text_outputs.hidden_state
+        text_mask = text_outputs.attention_mask
+        return text_states, text_mask
+
     def process_audio_emb(self, audio_emb):
         concatenated_tensors = []
 
@@ -66,11 +213,13 @@ class LatentDatasetAudio(Dataset):
 
         return audio_emb
 
+
+
     def __getitem__(self, idx):
         latent_file = self.data_anno[idx]["latent_path"]
-        prompt_embed_file = self.data_anno[idx]["prompt_embed_path"]
-        prompt_attention_mask_file = self.data_anno[idx][
-            "prompt_attention_mask"]
+        # prompt_embed_file = self.data_anno[idx]["prompt_embed_path"]
+        # prompt_attention_mask_file = self.data_anno[idx][
+        #     "prompt_attention_mask"]
         # 获取audio和face embedding文件路径
         audio_embed_file = self.data_anno[idx].get("audio_emb_path")
         face_embed_file = self.data_anno[idx].get("face_emb_path")
@@ -94,29 +243,42 @@ class LatentDatasetAudio(Dataset):
             weights_only=True,
         )
         latent = latent.squeeze(0)[:, -self.num_latent_t:]
+        cond_latents = get_cond_latents(self.args, latent, self.vae)
+        
+        is_uncond = (
+            torch.tensor(1).to(torch.int64)
+            if random.random() < self.args.sematic_cond_drop_p
+            else torch.tensor(0).to(torch.int64)
+        )
+
+        semantic_images = get_cond_images(self.args, cond_latents, self.vae, is_uncond=is_uncond)
+
 
         # load prompt
         if random.random() < self.cfg_rate:
             prompt_embed = self.uncond_prompt_embed
             prompt_attention_mask = self.uncond_prompt_mask
         else:
-            prompt_embed = torch.load(
-                os.path.join(self.prompt_embed_dir, prompt_embed_file),
-                map_location="cpu",
-                weights_only=True,
-            )
-            # Define path for potential error message
-            prompt_attention_mask_path = os.path.join(self.prompt_attention_mask_dir, prompt_attention_mask_file)
-            try:
-                prompt_attention_mask = torch.load(
-                    prompt_attention_mask_path,
-                    map_location="cpu",
-                    weights_only=True,
-                )
-            except Exception as e:
-                logger.warning(f"Failed to load prompt attention mask {prompt_attention_mask_path}: {e}. Creating a fallback mask.")
-                # Fallback: Create a boolean mask of ones with the same first dimension size as prompt_embed
-                prompt_attention_mask = torch.ones(prompt_embed.shape[0]-1, dtype=torch.bool, device="cpu")
+            prompt_tokens, prompt_attention_mask = self.get_text_tokens(self.text_encoder, self.data_anno[idx]["caption"])
+            prompt_embed, prompt_attention_mask = self.get_text_hidden_states(self.text_encoder, prompt_tokens, prompt_attention_mask, semantic_images)
+
+            # prompt_embed = torch.load(
+            #     os.path.join(self.prompt_embed_dir, prompt_embed_file),
+            #     map_location="cpu",
+            #     weights_only=True,
+            # )
+            # # Define path for potential error message
+            # prompt_attention_mask_path = os.path.join(self.prompt_attention_mask_dir, prompt_attention_mask_file)
+            # try:
+            #     prompt_attention_mask = torch.load(
+            #         prompt_attention_mask_path,
+            #         map_location="cpu",
+            #         weights_only=True,
+            #     )
+            # except Exception as e:
+            #     logger.warning(f"Failed to load prompt attention mask {prompt_attention_mask_path}: {e}. Creating a fallback mask.")
+            #     # Fallback: Create a boolean mask of ones with the same first dimension size as prompt_embed
+            #     prompt_attention_mask = torch.ones(prompt_embed.shape[0]-1, dtype=torch.bool, device="cpu")
         
 
         # 加载 audio 和 face embeddings
@@ -343,14 +505,14 @@ class LatentDatasetAudio(Dataset):
             face_mask = torch.ones_like(latent)
 
 
-        return latent, prompt_embed, prompt_attention_mask, audio_embed, face_embed, face_mask, audio_embed_file
+        return latent, prompt_embed, prompt_attention_mask, audio_embed, face_embed, face_mask, audio_embed_file, cond_latents
 
     def __len__(self):
         return len(self.data_anno)
 
 
-def latent_collate_function_audio(batch):
-    latents, prompt_embeds, prompt_attention_masks, audio_embeds, face_embeds, face_masks, audio_embed_files = zip(*batch)
+def latent_collate_function_audio_i2v(batch):
+    latents, prompt_embeds, prompt_attention_masks, audio_embeds, face_embeds, face_masks, audio_embed_files, cond_latents = zip(*batch)
 
     # --- 处理 Latents ---
     # 计算 batch 中 latent 的最大尺寸
@@ -381,6 +543,11 @@ def latent_collate_function_audio(batch):
     # --- 处理 Prompts ---
     prompt_embeds = torch.stack(prompt_embeds, dim=0)
     prompt_attention_masks = torch.stack(prompt_attention_masks, dim=0)
+
+    # --- 处理 Cond Latents ---
+    print(f"cond_latents shape before stack: {len(cond_latents)}, dtype: {cond_latents[0].dtype}")
+    cond_latents = torch.stack(cond_latents, dim=0)
+    print(f"cond_latents shape after stack: {cond_latents.shape}, dtype: {cond_latents.dtype}")
 
     # --- 处理 Face Masks ---
     # 在 __getitem__ 中 mask 已经与对应 latent 的（未padding）尺寸对齐
@@ -439,30 +606,102 @@ def latent_collate_function_audio(batch):
         face_embeds = None
 
     # 返回结果
-    return latents_stacked, prompt_embeds, latent_attn_mask, prompt_attention_masks, audio_embeds, face_embeds, face_masks_stacked, audio_embed_files
+    return latents_stacked, prompt_embeds, latent_attn_mask, prompt_attention_masks, audio_embeds, face_embeds, face_masks_stacked, audio_embed_files, cond_latents
 
 
 if __name__ == "__main__":
     # 注意：确保此处的 json 文件引用的 face_emb_path 对应的文件是新的坐标格式 (.pt 字典)
     # 或者旧的 .pt tensor / .png 格式以测试兼容性
-    dataset = LatentDatasetAudio(
-        "/wangbenyou/shunian/workspace/talking_face/model_training/FastVideo/data/hallo3-data-origin-1k/videos2caption.json", # 替换为你的 json 路径
-        num_latent_t=16, # 调整为你需要的 t 长度
-        cfg_rate=0.1
+    import torch.multiprocessing as mp
+
+
+    os.environ['MODEL_BASE'] = "/data/nas/yexin/workspace/shunian/model"
+    class Args:
+        # 从 finetune_hunyuan_audio_i2v.sh 和 train_audio_i2v.py 推断的参数
+        vae_precision = "bf16"
+        text_encoder = "llm-i2v"
+        text_encoder_precision = "fp16"
+        text_len = 256
+        tokenizer = "llm-i2v"
+        prompt_template = "dit-llm-encode-i2v"
+        prompt_template_video = "dit-llm-encode-video-i2v"
+        hidden_state_skip_layer = 2
+        i2v_mode = True
+        reproduce = True
+        apply_final_norm = False  # train_audio_i2v.py 中的默认值
+        model_type = "hunyuan_audio_i2v" # 从 finetune 脚本推断
+        num_latent_t = 32 # 从 finetune 脚本推断
+        # sematic_cond_drop_p 不是 argparse 参数，为测试设置一个默认值
+        sematic_cond_drop_p = 0.1
+        # cfg 在 dataset 中用于随机 uncond，在 train 中用于 guidance scale，这里保留示例值
+        cfg = 0 # --cfg in train script is 0.0, but dataset uses it differently
+
+    args = Args() # 实例化 Args
+
+    if args.i2v_mode:
+        image_embed_interleave = 4
+    else:
+        image_embed_interleave = 1
+
+
+    from fastvideo.utils.load import load_vae
+    # 使用 finetune 脚本中的 VAE 路径和 args 中的 model_type
+    vae, _, _ = load_vae(model_type=args.model_type, pretrained_model_name_or_path="/data/nas/yexin/workspace/shunian/model/")
+    vae = vae.to("cuda")
+
+    from fastvideo.models.hunyuan.text_encoder import TextEncoder_i2v
+    text_encoder = TextEncoder_i2v(
+            text_encoder_type=args.text_encoder,
+            max_length=args.text_len
+            + (
+                PROMPT_TEMPLATE[args.prompt_template_video].get("crop_start", 0)
+                if args.prompt_template_video is not None
+                else PROMPT_TEMPLATE[args.prompt_template].get("crop_start", 0)
+                if args.prompt_template is not None
+                else 0
+            ),
+            text_encoder_precision=args.text_encoder_precision,
+            tokenizer_type=args.tokenizer,
+            i2v_mode=args.i2v_mode,
+            prompt_template=(
+                PROMPT_TEMPLATE[args.prompt_template]
+                if args.prompt_template is not None
+                else None
+            ),
+            prompt_template_video=(
+                PROMPT_TEMPLATE[args.prompt_template_video]
+                if args.prompt_template_video is not None
+                else None
+            ),
+            hidden_state_skip_layer=args.hidden_state_skip_layer,
+            apply_final_norm=args.apply_final_norm,
+            reproduce=args.reproduce,
+            logger=logger,
+            device="cuda",
+            image_embed_interleave=image_embed_interleave
         )
 
+    dataset = LatentDatasetAudio_i2v(
+        "/data/nas/yexin/workspace/shunian/model_training/FastVideo/data/252_hour_test_480p_49frames/videos2caption.json", # 使用 finetune 脚本中的数据路径
+        num_latent_t=args.num_latent_t, # 使用 args 中的值
+        cfg_rate=args.cfg, # 使用 args 中的值
+        vae=vae,
+        text_encoder=text_encoder,
+        args=args, # 传递 args 对象
+        )
     # 更新 collate_fn
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=2,
         shuffle=False,
-        collate_fn=latent_collate_function_audio
+        num_workers=0,
+        collate_fn=latent_collate_function_audio_i2v
         )
 
     # 更新迭代变量
     for batch_data in dataloader:
         # 解包 batch 数据
-        latents, prompt_embeds, latent_attn_mask, prompt_attention_masks, audio_embeds, face_embeds, face_masks, audio_files = batch_data
+        latents, prompt_embeds, latent_attn_mask, prompt_attention_masks, audio_embeds, face_embeds, face_masks, audio_files, cond_latents = batch_data
 
         print("--- Batch Data ---")
         print(f"Latents shape: {latents.shape}, dtype: {latents.dtype}")
@@ -472,6 +711,7 @@ if __name__ == "__main__":
         print(f"Audio Embeds shape: {audio_embeds.shape if audio_embeds is not None else None}")
         print(f"Face Embeds shape: {face_embeds.shape if face_embeds is not None else None}")
         print(f"Face Masks shape: {face_masks.shape}, dtype: {face_masks.dtype}, Unique values: {torch.unique(face_masks)}")
+        print(f"Cond Latents shape: {cond_latents.shape}, dtype: {cond_latents.dtype}")
         # print(f"Audio Files: {audio_files}") # 可能太长，注释掉
 
         # 可以添加断点进行更详细的检查

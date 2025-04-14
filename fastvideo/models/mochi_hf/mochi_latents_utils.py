@@ -42,7 +42,7 @@ def normalize_dit_input(model_type, latents):
         return latents * 0.476986
     elif model_type == "hunyuan":
         return latents * 0.476986
-    elif model_type == "hunyuan_audio":
+    elif model_type == "hunyuan_audio" or model_type == "hunyuan_audio_i2v":
         logger.info(f"inside hunyuan_audio")
         logger.info(f"latents: {latents.shape}, device: {latents.device}, dtype: {latents.dtype}")
         
