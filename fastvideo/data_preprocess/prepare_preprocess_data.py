@@ -30,24 +30,24 @@ print(f"target_video_dir: {target_video_dir}")
 print(f"caption_data_path: {caption_data_path}")
 
 original_data = json.load(open(original_data_path, "r"))
-
 # 如果提供了 caption_data_path，则加载并合并数据
 # 注意：这部分合并逻辑可能需要根据你的 caption_data 格式进行调整或确认
 if caption_data_path and os.path.exists(caption_data_path):
     caption_data = json.load(open(caption_data_path, "r"))
-    print(f"original_data: {len(original_data)}")
-    original_data_dict = {data["id"]: data for data in original_data}
-    print(f"original_data_dict: {len(original_data_dict)}")
+    print(f"caption_data: {len(caption_data)}")
+    caption_data_dict = {data["id"]: data for data in caption_data}
+    print(f"caption_data_dict: {len(caption_data_dict)}")
+
 
     merged_data_list = []
-    for data in caption_data:
-        if data["video_folder"] in original_data_dict:
-            merge_item = original_data_dict[data["video_folder"]]
+    for data in original_data:
+        if data["id"] in caption_data_dict:
+            merge_item = data
             # 假设 caption 数据结构如原注释所示
-            if 'response' in data and 'choices' in data['response'] and data['response']['choices']:
-                 if 'message' in data['response']['choices'][0] and 'content' in data['response']['choices'][0]['message'] and 'description_summary' in data['response']['choices'][0]['message']['content']:
-                    merge_item['caption'] = data["response"]['choices'][0]['message']['content']["description_summary"]
-            merged_data_list.append(merge_item)
+            merge_item['caption'] = caption_data_dict[data["id"]]["description"] if "description" in caption_data_dict[data["id"]] else 'The man is talking'
+        else:
+            merge_item['caption'] = 'The man is talking'
+        merged_data_list.append(merge_item)
     original_data = merged_data_list # 使用合并后的数据
     print(f"merged_data: {len(original_data)}")
 else:

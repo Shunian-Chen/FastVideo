@@ -1,6 +1,6 @@
 from .models import HUNYUAN_VIDEO_CONFIG, HYVideoDiffusionTransformer
 from .model_audio import HYVideoDiffusionTransformerAudio
-
+from .model_audio_i2v import HYVideoDiffusionTransformerAudioI2V
 
 def load_model(args, in_channels, out_channels, factor_kwargs):
     """load hunyuan video model
@@ -16,6 +16,14 @@ def load_model(args, in_channels, out_channels, factor_kwargs):
     """
     if args.model_type == "hunyuan_audio":
         model = HYVideoDiffusionTransformerAudio(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            **HUNYUAN_VIDEO_CONFIG[args.model],
+            **factor_kwargs,
+        )
+        return model
+    elif args.model_type == "hunyuan_audio_i2v":
+        model = HYVideoDiffusionTransformerAudioI2V(
             in_channels=in_channels,
             out_channels=out_channels,
             **HUNYUAN_VIDEO_CONFIG[args.model],

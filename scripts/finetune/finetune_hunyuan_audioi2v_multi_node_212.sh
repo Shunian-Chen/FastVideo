@@ -3,13 +3,18 @@ export WANDB_MODE=online
 export WANDB_API_KEY="5b140725d3c02629d4f7599685125eb24df88b79"
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
+
+export NCCL_DEBUG=INFO
+
+
 # 根据CUDA_VISIBLE_DEVICES设置sp_size和nproc_per_node
 nproc_per_node=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 sp_size=1
+IP=172.27.38.139
 
 DATA_NAME="200_hour_480p_49frames_eng"
-EXPERIMENT_NAME="Hunyuan-Audio-Finetune-Hunyuan-ai2v-49frames-${DATA_NAME}-0502"
-LOG_DIR="/data/nas/yexin/workspace/shunian/model_training/FastVideo/logs/model_training/${EXPERIMENT_NAME}.log"
+EXPERIMENT_NAME="Hunyuan-Audio-Finetune-Hunyuan-ai2v-49frames-${DATA_NAME}-0503-debug-yexin3"
+LOG_DIR="/data/nas/yexin/workspace/shunian/model_training/FastVideo/logs/model_training/${EXPERIMENT_NAME}_212_debug_yexin2.log"
 OUTPUT_DIR="./data/outputs/${EXPERIMENT_NAME}"
 mkdir -p $(dirname $LOG_DIR)
 mkdir -p $(dirname $OUTPUT_DIR)
@@ -38,15 +43,18 @@ te_params=" \
 
 export MODEL_BASE="/data/nas/yexin/workspace/shunian/model"
 
-torchrun --nnodes 1 --nproc_per_node $nproc_per_node \
-    --master_port 29509 \
+torchrun --nnodes 2 --nproc_per_node $nproc_per_node \
+    --node_rank=0 \
+    --rdzv_id=456 \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=$IP:29500 \
     fastvideo/train_audio_i2v.py \
     --seed 42 \
     --pretrained_model_name_or_path /sds_wangby/models/HunyuanVideo/HunyuanVideo \
     --dit_model_name_or_path ${MODEL_BASE}/hunyuan-video-i2v-720p/transformers/mp_rank_00_model_states.pt\
     --model_type "hunyuan_audio_i2v" \
     --cache_dir data/.cache \
-    --data_json_path data/${DATA_NAME}/videos2caption.json \
+    --data_json_path data/${DATA_NAME}/videos2caption_cleaned.json \
     --validation_prompt_dir data/Image-Vid-Finetune-HunYuan/validation \
     --gradient_checkpointing \
     --train_batch_size=1 \
@@ -54,12 +62,12 @@ torchrun --nnodes 1 --nproc_per_node $nproc_per_node \
     --sp_size $sp_size \
     --train_sp_batch_size 1 \
     --dataloader_num_workers 8 \
-    --gradient_accumulation_steps=16 \
-    --max_train_steps=3000 \
+    --gradient_accumulation_steps=4 \
+    --max_train_steps=6000 \
     --learning_rate=1e-5 \
     --mixed_precision=bf16 \
     --checkpointing_steps=50 \
-    --validation_steps 3000 \
+    --validation_steps 6000 \
     --validation_sampling_steps 50 \
     --checkpoints_total_limit 3 \
     --allow_tf32 \

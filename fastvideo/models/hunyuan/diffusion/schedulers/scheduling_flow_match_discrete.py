@@ -148,7 +148,6 @@ class FlowMatchDiscreteScheduler(SchedulerMixin, ConfigMixin):
         self.sigmas = sigmas
         self.timesteps = (sigmas[:-1] * self.config.num_train_timesteps).to(
             dtype=torch.float32, device=device)
-
         # Reset step index
         self._step_index = None
 

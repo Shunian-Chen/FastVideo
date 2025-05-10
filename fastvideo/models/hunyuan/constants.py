@@ -111,6 +111,11 @@ MODEL_BASE = os.getenv("MODEL_BASE", "./data/hunyuan")
 # =================== Data =======================
 DATA_TYPE = {"image", "video", "image_video"}
 
+# 添加用于重建 mask 的常量
+BACKGROUND_VALUE = 0.1
+FACE_MASK_VALUE = 1
+LIP_MASK_VALUE = 5
+
 # 3D VAE
 VAE_PATH = {"884-16c-hy": f"{MODEL_BASE}/hunyuan-video-t2v-720p/vae"}
 

@@ -1,10 +1,11 @@
 #!/bin/bash
 
 # 设置GPU数量，默认为1
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-NUM_GPUS=${1:-4}
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# 设置GPU数量，根据CUDA_VISIBLE_DEVICES设置
+NUM_GPUS=$(echo ${CUDA_VISIBLE_DEVICES} | tr ',' '\n' | wc -l)
 # 设置主端口
-MASTER_PORT=${2:-29510}
+MASTER_PORT=29515
 
 echo "NUM_GPUS: ${NUM_GPUS}"
 echo "MASTER_PORT: ${MASTER_PORT}"
@@ -15,22 +16,22 @@ echo "MASTER_PORT: ${MASTER_PORT}"
 # - audios/: 存放对应的音频文件 (.wav)
 # 数据目录
 DATA_DIR="/data/nas/yexin/workspace/shunian/model_training/FastVideo/data/evaluation_480p_49frames"
-INPUT_PATH="/data/nas/yexin/workspace/shunian/model_training/FastVideo/data/evaluation_480p_49frames/videos2caption.json"
+INPUT_PATH="/data/nas/yexin/workspace/shunian/model_training/FastVideo/data/evaluation_480p_49frames/videos2caption_with_first_frame.json"
 
 # 模型基础路径
 export MODEL_BASE=/data/nas/yexin/workspace/shunian/model
 # 模型输出的基础目录 (包含所有 checkpoints)
-MODEL_OUTPUT_BASE_DIR="/data/nas/yexin/workspace/shunian/model_training/FastVideo/data/outputs/Hunyuan-Audio-Finetune-Hunyuan-audio-only-49frames-200_hour_480p_49frames_eng"
+MODEL_OUTPUT_BASE_DIR="/data/nas/yexin/workspace/shunian/model_training/FastVideo/data/outputs/Hunyuan-Audio-Finetune-Hunyuan-ai2v-49frames-200_hour_480p_49frames_eng-0503-debug-yexin3"
 # 从 MODEL_OUTPUT_BASE_DIR 提取模型名称
 MODEL_NAME=$(basename ${MODEL_OUTPUT_BASE_DIR})
 
 # 要测试的 Checkpoint 列表
-CHECKPOINTS=(100 500 800 1000)
+CHECKPOINTS=(4000 3500 3000 2500 2000)
 # 每个 Checkpoint 测试的视频数量
 MAX_SAMPLES=200
 
 # 模型类型
-MODEL_TYPE="hunyuan_audio"
+MODEL_TYPE="hunyuan_audio_i2v"
 # 推理步数
 INFERENCE_STEPS=50
 # 引导比例
@@ -38,13 +39,33 @@ GUIDANCE_SCALE=1.0
 # 嵌入式引导比例
 EMBEDDED_GUIDANCE_SCALE=6.0
 # Flow shift参数
-FLOW_SHIFT=17.0
+FLOW_SHIFT=7.0
 # 是否反向Flow
 FLOW_REVERSE="--flow_reverse"
 # 序列并行大小
 SP_SIZE=1
 
 precision="bf16"
+te_params=" \
+    --vae-model-name-or-path /data/nas/yexin/workspace/shunian/model/ \
+    --vae-precision fp16 \
+    --text-encoder llm-i2v \
+    --text-encoder-precision fp16 \
+    --text-states-dim 4096 \
+    --text-len 256 \
+    --tokenizer llm-i2v \
+    --prompt-template dit-llm-encode-i2v \
+    --prompt-template-video dit-llm-encode-video-i2v \
+    --hidden-state-skip-layer 2 \
+    --text-encoder-2 clipL \
+    --text-encoder-precision-2 fp16 \
+    --text-states-dim-2 768 \
+    --tokenizer-2 clipL \
+    --text-len-2 77 \
+    --i2v-mode \
+    --reproduce \
+    "
+
 
 # 循环遍历每个 Checkpoint
 for CKPT_NUM in "${CHECKPOINTS[@]}"; do
@@ -78,10 +99,13 @@ for CKPT_NUM in "${CHECKPOINTS[@]}"; do
     OUTPUT_DIR="data/outputs/result/${MODEL_NAME}/${CHECKPOINT_NAME}_evaluation"
     mkdir -p ${OUTPUT_DIR}
 
+    echo "OUTPUT_DIR: ${OUTPUT_DIR}"
+    echo "LOG_PATH: ${LOG_PATH}"
+
     # 运行推理脚本
-    echo "运行命令: torchrun --nnodes=1 --nproc_per_node=${NUM_GPUS} --master_port ${MASTER_PORT} fastvideo/sample/sample_at2v_hunyuan.py ..."
-    torchrun --nnodes=1 --nproc_per_node=${NUM_GPUS} --master_port ${MASTER_PORT} \
-        fastvideo/sample/sample_at2v_hunyuan.py \
+    echo "运行命令: torchrun --nnodes=1 --nproc_per_node=${NUM_GPUS} --master_port ${MASTER_PORT} fastvideo/sample/sample_ait2v_hunyuan.py ..."
+    python -m torch.distributed.run  --nnodes=1 --nproc_per_node=${NUM_GPUS} --master_port ${MASTER_PORT} \
+        fastvideo/sample/sample_ait2v_hunyuan.py \
         --input_path ${INPUT_PATH} \
         --output_dir ${OUTPUT_DIR} \
         --model_path ${MODEL_BASE} \
@@ -93,14 +117,17 @@ for CKPT_NUM in "${CHECKPOINTS[@]}"; do
         --flow_shift ${FLOW_SHIFT} \
         ${FLOW_REVERSE} \
         --sp_size ${SP_SIZE} \
-        --width 848 \
-        --height 480 \
+        --width 928 \
+        --height 544 \
         --num_frames 49 \
         --fps 24 \
         --precision ${precision} \
         --data_dir ${DATA_DIR} \
         --use_v2c_format \
         --max_samples ${MAX_SAMPLES} \
+        --i2v_mode \
+        --i2v_resolution 540p \
+        --i2v_stability \
         > ${LOG_PATH} 2>&1
 
     echo "Checkpoint ${CHECKPOINT_NAME} (限制 ${MAX_SAMPLES} samples) 推理完成，结果保存在 ${OUTPUT_DIR}"

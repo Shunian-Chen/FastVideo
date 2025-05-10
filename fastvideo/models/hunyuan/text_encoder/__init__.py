@@ -62,6 +62,30 @@ def load_text_encoder(
 
     return text_encoder, text_encoder_path
 
+def load_tokenizer_i2v(
+    tokenizer_type, tokenizer_path=None, padding_side="right", logger=None
+):
+    if tokenizer_path is None:
+        tokenizer_path = TOKENIZER_PATH[tokenizer_type]
+    if logger is not None:
+        logger.info(f"Loading tokenizer ({tokenizer_type}) from: {tokenizer_path}")
+
+    processor = None
+    if tokenizer_type == "clipL":
+        tokenizer = CLIPTokenizer.from_pretrained(tokenizer_path, max_length=77)
+    elif tokenizer_type == "llm":
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path, padding_side=padding_side
+        )
+    elif tokenizer_type == "llm-i2v":
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path, padding_side=padding_side
+        )
+        processor = CLIPImageProcessor.from_pretrained(tokenizer_path)
+    else:
+        raise ValueError(f"Unsupported tokenizer type: {tokenizer_type}")
+
+    return tokenizer, tokenizer_path, processor
 
 def load_tokenizer(tokenizer_type,
                    tokenizer_path=None,
@@ -460,7 +484,7 @@ class TextEncoder_i2v(nn.Module):
         self.dtype = self.model.dtype
         self.device = self.model.device
 
-        self.tokenizer, self.tokenizer_path, self.processor = load_tokenizer(
+        self.tokenizer, self.tokenizer_path, self.processor = load_tokenizer_i2v(
             tokenizer_type=self.tokenizer_type,
             tokenizer_path=self.tokenizer_path,
             padding_side="right",

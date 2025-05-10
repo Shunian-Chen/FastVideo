@@ -473,54 +473,28 @@ def prepare_sequence_parallel_data_audio(hidden_states, encoder_hidden_states,
     return hidden_states, encoder_hidden_states, attention_mask, encoder_attention_mask, audio_emb, face_emb, face_mask
 
 
-def prepare_sequence_parallel_data_audio_i2v(hidden_states, encoder_hidden_states,
-                                   attention_mask, encoder_attention_mask, audio_emb, face_emb, face_mask, cond_latents):
+def prepare_sequence_parallel_data_audio_i2v(hidden_states, audio_embeds, face_mask):
     if nccl_info.sp_size == 1:
         return (
             hidden_states,
-            encoder_hidden_states,
-            attention_mask,
-            encoder_attention_mask,
-            audio_emb,
-            face_emb,
+            audio_embeds,
             face_mask,
-            cond_latents,
         )
 
-    def prepare(hidden_states, encoder_hidden_states, attention_mask,
-                encoder_attention_mask, audio_emb, face_emb, face_mask, cond_latents):
+    def prepare(hidden_states, audio_embeds, face_mask):
         hidden_states = all_to_all(hidden_states, scatter_dim=2, gather_dim=0)
-        encoder_hidden_states = all_to_all(encoder_hidden_states,
-                                           scatter_dim=1,
-                                           gather_dim=0)
-        attention_mask = all_to_all(attention_mask,
+        audio_embeds = all_to_all(audio_embeds,
                                     scatter_dim=1,
                                     gather_dim=0)
-        encoder_attention_mask = all_to_all(encoder_attention_mask,
-                                            scatter_dim=1,
-                                            gather_dim=0)
-        audio_emb = all_to_all(audio_emb,
-                              scatter_dim=1,
-                              gather_dim=0)
-        face_emb = all_to_all(face_emb,
-                              scatter_dim=1,
-                              gather_dim=0)
         face_mask = all_to_all(face_mask,
                               scatter_dim=2,
                               gather_dim=0)
-        cond_latents = all_to_all(cond_latents,
-                              scatter_dim=2,
-                              gather_dim=0)
+
         
         return (
             hidden_states,
-            encoder_hidden_states,
-            attention_mask,
-            encoder_attention_mask,
-            audio_emb,
-            face_emb,
+            audio_embeds,
             face_mask,
-            cond_latents,
         )
 
 
@@ -551,48 +525,35 @@ def prepare_sequence_parallel_data_audio_i2v(hidden_states, encoder_hidden_state
 
     # 如果audio_frame不是sp_size的倍数，则需要进行padding，audio_emb的维度是(bs, frame, w, b, d)
     # audio_emb = check_padding(audio_emb)
-    audio_frame = audio_emb.shape[1]
+    audio_frame = audio_embeds.shape[1]
     if audio_frame % nccl_info.sp_size != 0:
         remainder = audio_frame % nccl_info.sp_size
         padding = nccl_info.sp_size - remainder
         # 构造需要补齐的零张量
-        pad_shape = list(audio_emb.shape)
+        pad_shape = list(audio_embeds.shape)
         pad_shape[1] = padding
-        zeros_pad = torch.zeros(pad_shape, dtype=audio_emb.dtype, device=audio_emb.device)
+        zeros_pad = torch.zeros(pad_shape, dtype=audio_embeds.dtype, device=audio_embeds.device)
         # 拼接到原张量上完成padding
-        audio_emb = torch.cat([audio_emb, zeros_pad], dim=1)
+        audio_embeds = torch.cat([audio_embeds, zeros_pad], dim=1)
 
-    print(f"audio_emb.shape before prepare: {audio_emb.shape}")
-    print(f"Inside prepare_sequence_parallel_data_audio, before prepare, latent shape: {hidden_states.shape}")
-    print(f"Inside prepare_sequence_parallel_data_audio, before prepare, audio_emb shape: {audio_emb.shape}")
-    print(f"Inside prepare_sequence_parallel_data_audio, before prepare, face_emb shape: {face_emb.shape}")
-    print(f"Inside prepare_sequence_parallel_data_audio, before prepare, cond_latents shape: {cond_latents.shape}")
+    # print(f"Inside prepare_sequence_parallel_data_audio_i2v, before prepare, latent shape: {hidden_states.shape}")
+    # print(f"Inside prepare_sequence_parallel_data_audio_i2v, before prepare, audio_embeds shape: {audio_embeds.shape}")
 
     (
         hidden_states,
-        encoder_hidden_states,
-        attention_mask,
-        encoder_attention_mask,
-        audio_emb,
-        face_emb,
+        audio_embeds,
         face_mask,
     ) = prepare(
         hidden_states,
-        encoder_hidden_states.repeat(1, sp_size, 1),
-        attention_mask.repeat(1, sp_size, 1, 1),
-        encoder_attention_mask.repeat(1, sp_size),
-        audio_emb,
-        face_emb.repeat(1, sp_size),
+        audio_embeds,
         face_mask,
-        cond_latents.repeat(1, 1, sp_size, 1, 1),
     )
-    print(f"audio_emb.shape after prepare: {audio_emb.shape}")
-    print(f"Inside prepare_sequence_parallel_data_audio, after prepare, latent shape: {hidden_states.shape}")
-    print(f"Inside prepare_sequence_parallel_data_audio, after prepare, audio_emb shape: {audio_emb.shape}")
-    print(f"Inside prepare_sequence_parallel_data_audio, after prepare, face_emb shape: {face_emb.shape}")
-    print(f"Inside prepare_sequence_parallel_data_audio, after prepare, cond_latents shape: {cond_latents.shape}")
+    # print(f"audio_embeds.shape after prepare: {audio_embeds.shape}")
+    # print(f"Inside prepare_sequence_parallel_data_audio_i2v, after prepare, latent shape: {hidden_states.shape}")
+    # print(f"Inside prepare_sequence_parallel_data_audio_i2v, after prepare, audio_embeds shape: {audio_embeds.shape}")
+    # print(f"Inside prepare_sequence_parallel_data_audio_i2v, after prepare, face_mask shape: {face_mask.shape}")
 
-    return hidden_states, encoder_hidden_states, attention_mask, encoder_attention_mask, audio_emb, face_emb, face_mask, cond_latents
+    return hidden_states, audio_embeds, face_mask
 
 
 def sp_parallel_dataloader_wrapper_audio(dataloader, device, train_batch_size,
@@ -663,39 +624,27 @@ def sp_parallel_dataloader_wrapper_audio_i2v(dataloader, device, train_batch_siz
                                    sp_size, train_sp_batch_size):
     while True:
         for data_item in dataloader:
-            latents, cond, attn_mask, cond_mask, audio_emb, face_emb, face_mask, audio_embed_file, cond_latents = data_item
-            # print(f"audio_embed.shape in sp_parallel_dataloader_wrapper_audio: {audio_emb.shape}")
+            latents, captions, audio_embeds, face_mask, sample_id = data_item
             # print(f"Inside sp_parallel_dataloader_wrapper, latents shape: {latents.shape}")
-            # print(f"Inside sp_parallel_dataloader_wrapper, audio_emb shape: {audio_emb.shape}")
-            # print(f"Inside sp_parallel_dataloader_wrapper, face_emb shape: {face_emb.shape}")
+            # print(f"Inside sp_parallel_dataloader_wrapper, audio_embeds shape: {audio_embeds.shape}")
+            # print(f"Inside sp_parallel_dataloader_wrapper, face_mask shape: {face_mask.shape}")
+            # print(f"Inside sp_parallel_dataloader_wrapper, captions: {captions}")
             latents = latents.to(device)
-            cond = cond.to(device)
-            attn_mask = attn_mask.to(device)
-            cond_mask = cond_mask.to(device)
-            cond_latents = cond_latents.to(device)
-            # 确保audio_emb和face_emb是tensor类型并移到正确设备
-            if audio_emb is not None:
-                if not isinstance(audio_emb, torch.Tensor):
-                    audio_emb = torch.as_tensor(audio_emb)
-                audio_emb = audio_emb.to(device)
-            if face_emb is not None:
-                if not isinstance(face_emb, torch.Tensor):
-                    face_emb = torch.as_tensor(face_emb)
-                face_emb = face_emb.to(device)
+            # 确保audio_embeds和face_mask是tensor类型并移到正确设备
+            if audio_embeds is not None:
+                if not isinstance(audio_embeds, torch.Tensor):
+                    audio_embeds = torch.as_tensor(audio_embeds)
+                audio_embeds = audio_embeds.to(device)
             if face_mask is not None:
                 if not isinstance(face_mask, torch.Tensor):
                     face_mask = torch.as_tensor(face_mask)
                 face_mask = face_mask.to(device)
-            if cond_latents is not None:
-                if not isinstance(cond_latents, torch.Tensor):
-                    cond_latents = torch.as_tensor(cond_latents)
-                cond_latents = cond_latents.to(device)
             frame = latents.shape[2]
             if frame == 1:
-                yield latents, cond, attn_mask, cond_mask, audio_emb, face_emb, face_mask, audio_embed_file, cond_latents
+                yield latents, captions, audio_embeds, face_mask, sample_id
             else:
-                latents, cond, attn_mask, cond_mask, audio_emb, face_emb, face_mask, cond_latents = prepare_sequence_parallel_data_audio_i2v(
-                    latents, cond, attn_mask, cond_mask, audio_emb, face_emb, face_mask, cond_latents)
+                latents, audio_embeds, face_mask = prepare_sequence_parallel_data_audio_i2v(
+                    latents, audio_embeds, face_mask)
                 assert (
                     train_batch_size * sp_size >= train_sp_batch_size
                 ), "train_batch_size * sp_size should be greater than train_sp_batch_size"
@@ -707,25 +656,18 @@ def sp_parallel_dataloader_wrapper_audio_i2v(dataloader, device, train_batch_siz
                     ed_idx = (iter + 1) * train_sp_batch_size
                     # print(f"Inside sp_parallel_dataloader_wrapper, st_idx: {st_idx}, ed_idx: {ed_idx}")
                     latent_t = latents[st_idx:ed_idx]
-                    encoder_hidden_states = cond[st_idx:ed_idx]
-                    attention_mask = attn_mask[st_idx:ed_idx]
-                    encoder_attention_mask = cond_mask[st_idx:ed_idx]
-                    audio_emb_t = audio_emb[st_idx:ed_idx]
-                    face_emb_t = face_emb[st_idx:ed_idx]
+                    captions_t = captions[st_idx:ed_idx]
+                    audio_embeds_t = audio_embeds[st_idx:ed_idx] if audio_embeds is not None else None
                     face_mask_t = face_mask[st_idx:ed_idx]
-                    cond_latents_t = cond_latents[st_idx:ed_idx]
-                    # print(f"audio_emb_t.shape: {audio_emb_t.shape}")
+                    sample_id_t = sample_id[st_idx:ed_idx]
+                    # print(f"audio_embeds_t.shape: {audio_embeds_t.shape}")
                     # print(f"Inside sp_parallel_dataloader_wrapper, latent_t shape: {latent_t.shape}")
-                    # print(f"Inside sp_parallel_dataloader_wrapper, audio_emb shape: {audio_emb_t.shape}")
-                    # print(f"Inside sp_parallel_dataloader_wrapper, face_emb shape: {face_emb_t.shape}")
+                    # print(f"Inside sp_parallel_dataloader_wrapper, captions_t: {captions_t}")
+                    # print(f"Inside sp_parallel_dataloader_wrapper, face_mask shape: {face_mask_t.shape}")
                     yield (
                         latent_t,
-                        encoder_hidden_states,
-                        attention_mask,
-                        encoder_attention_mask,
-                        audio_emb_t,
-                        face_emb_t,
+                        captions_t,
+                        audio_embeds_t,
                         face_mask_t,
-                        audio_embed_file,
-                        cond_latents_t,
+                        sample_id_t,
                     )

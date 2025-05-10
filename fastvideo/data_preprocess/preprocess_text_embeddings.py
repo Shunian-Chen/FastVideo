@@ -4,6 +4,8 @@ import os
 
 import torch
 import torch.distributed as dist
+import torch.utils.data.dataloader
+from accelerate import PartialState
 from accelerate.logging import get_logger
 from diffusers.utils import export_to_video
 from diffusers.video_processor import VideoProcessor
@@ -21,9 +23,11 @@ class T5dataset(Dataset):
     def __init__(
         self,
         json_path,
+        output_dir,
         vae_debug,
     ):
         self.json_path = json_path
+        self.output_dir = output_dir
         self.vae_debug = vae_debug
         with open(self.json_path, "r") as f:
             # train_dataset = json.load(f)[1000:2000]
@@ -32,43 +36,63 @@ class T5dataset(Dataset):
                                         key=lambda x: x["latent_path"])
 
     def __getitem__(self, idx):
-        caption = self.train_dataset[idx]["caption"][0]
-        filename = self.train_dataset[idx]["latent_path"].split(".")[0].split("/")[-1]
-        latent_path = self.train_dataset[idx]["latent_path"]
-        audio_emb_path = self.train_dataset[idx]["audio_emb_path"]
-        face_emb_path = self.train_dataset[idx]["face_emb_path"]
+        item_data = self.train_dataset[idx]
+        caption = item_data["caption"][0]
+        filename = item_data["latent_path"].split(".")[0].split("/")[-1]
+        latent_path = item_data["latent_path"]
+        audio_emb_path = item_data["audio_emb_path"]
+        face_emb_path = item_data["face_emb_path"]
+        full_latent_path = os.path.join(self.output_dir, "latent", latent_path)
 
-        latent = torch.load(os.path.join(args.output_dir, "latent", latent_path), map_location="cpu")
-        length = latent.shape[1]
-        if self.vae_debug:
-            latents = torch.load(
-                os.path.join(args.output_dir, "latent",
-                             self.train_dataset[idx]["latent_path"]),
-                map_location="cpu",
+        try:
+            latent = torch.load(full_latent_path, map_location="cpu")
+            length = latent.shape[1]
+
+            result = dict(
+                caption=caption,
+                filename=filename,
+                length=length,
+                latent_path=latent_path,
+                audio_emb_path=audio_emb_path,
+                face_emb_path=face_emb_path,
+                error=False
             )
-        else:
-            latents = []
 
-        # return dict(caption=caption,
-        #             latents=latents,
-        #             filename=filename,
-        #             length=length)
-        return dict(caption=caption,
-                    latents=latents,
-                    filename=filename,
-                    length=length,
-                    latent_path=latent_path,
-                    audio_emb_path=audio_emb_path,
-                    face_emb_path=face_emb_path)
+        except RuntimeError as e:
+            print(f"[DataLoader Worker] Skipping sample {idx} due to RuntimeError loading latent '{full_latent_path}': {e}")
+            result = {"error": True, "latent_path": latent_path}
+        except FileNotFoundError:
+            print(f"[DataLoader Worker] Skipping sample {idx} because latent file not found: '{full_latent_path}'")
+            result = {"error": True, "latent_path": latent_path}
+        except Exception as e:
+            print(f"[DataLoader Worker] Skipping sample {idx} due to unexpected error loading latent '{full_latent_path}': {e}")
+            result = {"error": True, "latent_path": latent_path}
+
+        return result
 
     def __len__(self):
         return len(self.train_dataset)
+
+
+def collate_fn(batch):
+    """
+    Filters out items that have errors and collates the valid ones.
+    """
+    valid_batch = [item for item in batch if not item.get("error")]
+    if not valid_batch:
+        # Return None if the entire batch consists of errors
+        return None
+    # Use the default collate function for the valid items
+    return torch.utils.data.dataloader.default_collate(valid_batch)
 
 
 def main(args):
     local_rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
     print("world_size", world_size, "local rank", local_rank)
+
+    # Initialize PartialState early to enable logging
+    PartialState()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.cuda.set_device(local_rank)
@@ -88,7 +112,7 @@ def main(args):
 
     latents_json_path = os.path.join(args.output_dir,
                                      "videos2caption_temp.json")
-    train_dataset = T5dataset(latents_json_path, args.vae_debug)
+    train_dataset = T5dataset(latents_json_path, args.output_dir, args.vae_debug)
     text_encoder = load_text_encoder(args.model_type,
                                      args.model_path,
                                      device=device)
@@ -103,45 +127,75 @@ def main(args):
         sampler=sampler,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
+        collate_fn=collate_fn,
     )
 
     json_data = []
     total_batches = len(train_dataloader)
     for _, data in tqdm(enumerate(train_dataloader), disable=local_rank != 0, total = total_batches, desc=f"[Rank {local_rank}] 处理进度", leave=True):
+        if data is None:
+            logger.warning(f"Rank {local_rank}: Skipping a batch because all samples failed to load.")
+            continue
+
         with torch.inference_mode():
-            with torch.autocast("cuda", dtype=autocast_type):
-                prompt_embeds, prompt_attention_mask = text_encoder.encode_prompt(
-                    prompt=data["caption"], )
-                if args.vae_debug:
-                    latents = data["latents"]
-                    video = vae.decode(latents.to(device),
-                                       return_dict=False)[0]
-                    video = videoprocessor.postprocess_video(video)
-                for idx, video_name in enumerate(data["filename"]):
-                    prompt_embed_path = os.path.join(args.output_dir,
-                                                     "prompt_embed",
-                                                     video_name + ".pt")
-                    video_path = os.path.join(args.output_dir, "video",
-                                              video_name + ".mp4")
-                    prompt_attention_mask_path = os.path.join(
-                        args.output_dir, "prompt_attention_mask",
-                        video_name + ".pt")
-                    # save latent
-                    torch.save(prompt_embeds[idx], prompt_embed_path)
-                    torch.save(prompt_attention_mask[idx],
-                               prompt_attention_mask_path)
-                    print(f"sample {video_name} saved")
-                    if args.vae_debug:
-                        export_to_video(video[idx], video_path, fps=fps)
+
+            for idx_in_batch in range(len(data["filename"])):
+                video_name = data["filename"][idx_in_batch]
+                current_latent_path = data["latent_path"][idx_in_batch]
+
+                # Define output paths
+                prompt_embed_path = os.path.join(args.output_dir, "prompt_embed", video_name + ".pt")
+                prompt_attention_mask_path = os.path.join(args.output_dir, "prompt_attention_mask", video_name + ".pt")
+
+                # Check if output files already exist
+                if os.path.exists(prompt_embed_path) and os.path.exists(prompt_attention_mask_path):
+                    logger.info(f"Rank {local_rank}: Skipping {video_name} as embeddings already exist.")
                     item = {}
-                    item["length"] = int(data["length"][idx])
-                    item["latent_path"] = os.path.basename(data["latent_path"][idx])
-                    item["audio_emb_path"] = os.path.basename(data["audio_emb_path"][idx])
-                    item["face_emb_path"] = os.path.basename(data["face_emb_path"][idx])
+                    item["length"] = int(data["length"][idx_in_batch])
+                    item["latent_path"] = os.path.basename(data["latent_path"][idx_in_batch])
+                    item["audio_emb_path"] = os.path.basename(data["audio_emb_path"][idx_in_batch])
+                    item["face_emb_path"] = os.path.basename(data["face_emb_path"][idx_in_batch])
                     item["prompt_embed_path"] = os.path.basename(prompt_embed_path)
                     item["prompt_attention_mask"] = os.path.basename(prompt_attention_mask_path)
-                    item["caption"] = data["caption"][idx]
+                    item["caption"] = data["caption"][idx_in_batch]
                     json_data.append(item)
+                    print(f"Rank {local_rank}: Skipping {video_name} as embeddings already exist.")
+                    continue # Skip to the next item in the batch
+
+                with torch.autocast("cuda", dtype=autocast_type):
+                    prompt_embeds, prompt_attention_mask = text_encoder.encode_prompt(
+                        prompt=data["caption"],
+                    )
+                if args.vae_debug:
+                    try:
+                        full_latent_path = os.path.join(args.output_dir, "latent", current_latent_path)
+                        latents = torch.load(full_latent_path, map_location="cpu")
+                        latents = latents.to(device)
+
+                        video_frames = vae.decode(latents.unsqueeze(0), return_dict=False)[0]
+                        video = videoprocessor.postprocess_video(video_frames)
+
+                        video_output_path = os.path.join(args.output_dir, "video", video_name + ".mp4")
+                        export_to_video(video, video_output_path, fps=fps)
+                        print(f"sample videovideo {video_name} saved")
+                    except Exception as e:
+                        logger.error(f"Rank {local_rank}: Error during VAE decode/save for {video_name} (latent: {current_latent_path}): {e}")
+
+                # Save the embedding and mask for the current item
+                # prompt_embeds and prompt_attention_mask are batched, index with idx_in_batch
+                torch.save(prompt_embeds[idx_in_batch], prompt_embed_path)
+                torch.save(prompt_attention_mask[idx_in_batch], prompt_attention_mask_path)
+
+                item = {}
+                item["length"] = int(data["length"][idx_in_batch])
+                item["latent_path"] = os.path.basename(data["latent_path"][idx_in_batch])
+                item["audio_emb_path"] = os.path.basename(data["audio_emb_path"][idx_in_batch])
+                item["face_emb_path"] = os.path.basename(data["face_emb_path"][idx_in_batch])
+                item["prompt_embed_path"] = os.path.basename(prompt_embed_path)
+                item["prompt_attention_mask"] = os.path.basename(prompt_attention_mask_path)
+                item["caption"] = data["caption"][idx_in_batch]
+                json_data.append(item)
+
     dist.barrier()
     local_data = json_data
     gathered_data = [None] * world_size

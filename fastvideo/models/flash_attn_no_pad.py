@@ -1,7 +1,7 @@
 from einops import rearrange
 from flash_attn import flash_attn_varlen_qkvpacked_func
 from flash_attn.bert_padding import pad_input, unpad_input
-
+import torch
 
 def flash_attn_no_pad(qkv,
                       key_padding_mask,
@@ -20,6 +20,7 @@ def flash_attn_no_pad(qkv,
                         "nnz (three h d) -> nnz three h d",
                         three=3,
                         h=nheads)
+
     output_unpad = flash_attn_varlen_qkvpacked_func(
         x_unpad,
         cu_seqlens,

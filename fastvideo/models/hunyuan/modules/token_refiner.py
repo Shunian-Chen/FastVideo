@@ -5,7 +5,7 @@ import torch.nn as nn
 from einops import rearrange
 
 from .activation_layers import get_activation_layer
-from .attenion import attention
+from .attenion import attention, attention_flash
 from .embed_layers import TextProjection, TimestepEmbedder
 from .mlp_layers import MLP
 from .modulate_layers import apply_gate
@@ -97,7 +97,7 @@ class IndividualTokenRefinerBlock(nn.Module):
         k = self.self_attn_k_norm(k).to(v)
 
         # Self-Attention
-        attn = attention(q, k, v, attn_mask=attn_mask)
+        attn = attention_flash(q, k, v, mode="torch", attn_mask=attn_mask)
 
         x = x + apply_gate(self.self_attn_proj(attn), gate_msa)
 
@@ -145,11 +145,24 @@ class IndividualTokenRefiner(nn.Module):
         c: torch.LongTensor,
         mask: Optional[torch.Tensor] = None,
     ):
-        mask = mask.clone().bool()
-        # avoid attention weight become NaN
-        mask[:, 0] = True
+        self_attn_mask = None
+        if mask is not None:
+            batch_size = mask.shape[0]
+            seq_len = mask.shape[1]
+            mask = mask.to(x.device)
+            # batch_size x 1 x seq_len x seq_len
+            self_attn_mask_1 = mask.view(batch_size, 1, 1, seq_len).repeat(
+                1, 1, seq_len, 1
+            )
+            # batch_size x 1 x seq_len x seq_len
+            self_attn_mask_2 = self_attn_mask_1.transpose(2, 3)
+            # batch_size x 1 x seq_len x seq_len, 1 for broadcasting of heads_num
+            self_attn_mask = (self_attn_mask_1 & self_attn_mask_2).bool()
+            # avoids self-attention weight being NaN for padding tokens
+            self_attn_mask[:, :, :, 0] = True
+
         for block in self.blocks:
-            x = block(x, c, mask)
+            x = block(x, c, self_attn_mask)
         return x
 
 
@@ -211,6 +224,7 @@ class SingleTokenRefiner(nn.Module):
         t: torch.LongTensor,
         mask: Optional[torch.LongTensor] = None,
     ):
+        
         timestep_aware_representations = self.t_embedder(t)
 
         if mask is None:
@@ -221,6 +235,7 @@ class SingleTokenRefiner(nn.Module):
                 dim=1) / mask_float.sum(dim=1)
         context_aware_representations = self.c_embedder(
             context_aware_representations)
+        # breakpoint()
         c = timestep_aware_representations + context_aware_representations
 
         x = self.input_embedder(x)

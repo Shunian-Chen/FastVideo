@@ -4,6 +4,11 @@ import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+import torch.distributed.checkpoint as dist_cp
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import StateDictType
 from loguru import logger
 from safetensors.torch import load_file as safetensors_load_file
 
@@ -72,6 +77,16 @@ class Inference(object):
             f"Got text-to-video model root path: {pretrained_model_path}")
 
         # ==================== Initialize Distributed Environment ================
+        # Ensure distributed is initialized if needed for loading sharded checkpoints
+        if args.sp_size > 1 and not dist.is_initialized():
+             # This assumes init_process_group is called elsewhere before from_pretrained
+             # If not, it needs to be initialized here or earlier.
+             # For now, we assume it's initialized if sp_size > 1
+             if os.environ.get("RANK") is not None and os.environ.get("WORLD_SIZE") is not None:
+                 logger.warning("Distributed environment not initialized, but SP size > 1. Assuming it's handled externally.")
+             # else:
+                 # raise RuntimeError("Distributed environment must be initialized for SP > 1.")
+
         if nccl_info.sp_size > 1:
             device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}")
         if device is None:
@@ -99,9 +114,27 @@ class Inference(object):
             out_channels=out_channels,
             factor_kwargs=factor_kwargs,
         )
+
+        # --- Crucial Change: Move model loading AFTER potential FSDP wrapping ---
+        # The original code loaded state_dict before potential FSDP wrapping.
+        # If loading sharded state, the model MUST be FSDP wrapped first.
+        # We will load the state dict later.
+        # For now, just move the model to the correct device.
         model = model.to(device)
-        model = Inference.load_state_dict(args, model, pretrained_model_path)
+
+        # --- Potential FSDP Wrapping (if applicable, based on your training setup) ---
+        # If your inference needs FSDP wrapping (e.g., for very large models),
+        # you would wrap the model here *before* loading the state dict.
+        # Example (needs correct FSDP config):
+        # if args.use_fsdp_inference: # Add an argument like this if needed
+        #     fsdp_config = {...} # Your FSDP configuration
+        #     model = FSDP(model, **fsdp_config)
+        #     dist.barrier() # Ensure all ranks wrap before loading
+
+        # --- Load State Dict (Now potentially on an FSDP model) ---
+        model = Inference.load_state_dict(args, model, pretrained_model_path, device)
         model.eval()
+
 
         # ============================= Build extra models ========================
         # VAE
@@ -172,92 +205,174 @@ class Inference(object):
         )
 
     @staticmethod
-    def load_state_dict(args, model, pretrained_model_path):
-        load_key = args.load_key
-        dit_weight = Path(args.dit_weight)
+    def load_state_dict(args, model, pretrained_model_path, device):
+        """
+        Loads the model state dict. Supports loading single files (.pt, .safetensors)
+        and FSDP sharded checkpoints saved via dist_cp.
 
-        if dit_weight is None:
-            model_dir = pretrained_model_path / f"t2v_{args.model_resolution}"
-            files = list(model_dir.glob("*.pt"))
-            if len(files) == 0:
-                raise ValueError(f"No model weights found in {model_dir}")
-            if str(files[0]).startswith("pytorch_model_"):
-                model_path = dit_weight / f"pytorch_model_{load_key}.pt"
-                bare_model = True
-            elif any(str(f).endswith("_model_states.pt") for f in files):
-                files = [
-                    f for f in files if str(f).endswith("_model_states.pt")
-                ]
-                model_path = files[0]
-                if len(files) > 1:
-                    logger.warning(
-                        f"Multiple model weights found in {dit_weight}, using {model_path}"
-                    )
-                bare_model = False
-            else:
-                raise ValueError(
-                    f"Invalid model path: {dit_weight} with unrecognized weight format: "
-                    f"{list(map(str, files))}. When given a directory as --dit-weight, only "
-                    f"`pytorch_model_*.pt`(provided by HunyuanDiT official) and "
-                    f"`*_model_states.pt`(saved by deepspeed) can be parsed. If you want to load a "
-                    f"specific weight file, please provide the full path to the file."
-                )
-        else:
-            if dit_weight.is_dir():
-                files = list(dit_weight.glob("*.pt"))
-                if len(files) == 0:
-                    raise ValueError(f"No model weights found in {dit_weight}")
-                if str(files[0]).startswith("pytorch_model_"):
-                    model_path = dit_weight / f"pytorch_model_{load_key}.pt"
-                    bare_model = True
-                elif any(str(f).endswith("_model_states.pt") for f in files):
-                    files = [
-                        f for f in files if str(f).endswith("_model_states.pt")
-                    ]
-                    model_path = files[0]
-                    if len(files) > 1:
-                        logger.warning(
-                            f"Multiple model weights found in {dit_weight}, using {model_path}"
-                        )
-                    bare_model = False
+        Args:
+            args: Command line arguments. Expected to have `dit_weight` and potentially others.
+            model: The model instance (potentially FSDP wrapped).
+            pretrained_model_path: Base path for models if `dit_weight` is relative or not provided.
+            device: The target device.
+
+        Returns:
+            The model with loaded state dict.
+        """
+        load_key = args.load_key # Used for non-sharded legacy checkpoints
+        dit_weight_path = Path(args.dit_weight) if args.dit_weight else None
+
+        # Determine the final path to load from
+        load_path = None
+        is_sharded = False
+
+        if dit_weight_path:
+            if dit_weight_path.is_dir():
+                # Check if it's a sharded checkpoint directory
+                model_state_dir = dit_weight_path / "model_sharded_state"
+                if model_state_dir.is_dir():
+                    logger.info(f"Detected FSDP sharded checkpoint directory: {dit_weight_path}")
+                    load_path = dit_weight_path
+                    is_sharded = True
                 else:
-                    raise ValueError(
-                        f"Invalid model path: {dit_weight} with unrecognized weight format: "
-                        f"{list(map(str, files))}. When given a directory as --dit-weight, only "
-                        f"`pytorch_model_*.pt`(provided by HunyuanDiT official) and "
-                        f"`*_model_states.pt`(saved by deepspeed) can be parsed. If you want to load a "
-                        f"specific weight file, please provide the full path to the file."
-                    )
-            elif dit_weight.is_file():
-                model_path = dit_weight
-                bare_model = "unknown"
-            else:
-                raise ValueError(f"Invalid model path: {dit_weight}")
+                    # Assume it's a directory containing single weight files (legacy)
+                    logger.warning(f"Directory specified in --dit-weight ({dit_weight_path}) does not contain 'model_sharded_state'. Looking for legacy files...")
+                    files = list(dit_weight_path.glob("*.pt")) + list(dit_weight_path.glob("*.safetensors"))
+                    if not files:
+                        raise ValueError(f"No model weights (.pt or .safetensors) found in directory: {dit_weight_path}")
+                    # Attempt to find standard names, default to the first found file otherwise
+                    potential_paths = [
+                        dit_weight_path / f"pytorch_model_{load_key}.pt",
+                        dit_weight_path / "diffusion_pytorch_model.safetensors", # Common name
+                        dit_weight_path / "model.safetensors"
+                    ]
+                    found = False
+                    for p in potential_paths:
+                        if p.is_file():
+                            load_path = p
+                            found = True
+                            logger.info(f"Found legacy weight file: {load_path}")
+                            break
+                    if not found:
+                        load_path = files[0] # Fallback to the first file found
+                        logger.warning(f"Could not find standard weight names, loading first found file: {load_path}")
 
-        if not model_path.exists():
-            raise ValueError(f"model_path not exists: {model_path}")
-        logger.info(f"Loading torch model {model_path}...")
-        if model_path.suffix == ".safetensors":
-            # Use safetensors library for .safetensors files
-            state_dict = safetensors_load_file(model_path)
-        elif model_path.suffix == ".pt":
-            # Use torch for .pt files
-            state_dict = torch.load(model_path,
-                                    map_location=lambda storage, loc: storage)
+            elif dit_weight_path.is_file():
+                # It's a direct path to a single weight file
+                load_path = dit_weight_path
+                logger.info(f"Loading single weight file: {load_path}")
+            else:
+                raise FileNotFoundError(f"Specified --dit-weight path does not exist: {dit_weight_path}")
         else:
-            raise ValueError(f"Unsupported file format: {model_path}")
+            # --dit-weight not provided, fall back to looking in pretrained_model_path (legacy behavior)
+            logger.warning("--dit-weight not provided. Attempting to find weights in pretrained_model_path (legacy behavior).")
+            model_dir = Path(pretrained_model_path) / f"t2v_{args.model_resolution}" # Example legacy structure
+            files = list(model_dir.glob("*.pt")) + list(model_dir.glob("*.safetensors"))
+            if not files:
+                raise ValueError(f"No model weights found in legacy path: {model_dir}")
 
-        if bare_model == "unknown" and ("ema" in state_dict
-                                        or "module" in state_dict):
-            bare_model = False
-        if bare_model is False:
-            if load_key in state_dict:
-                state_dict = state_dict[load_key]
+            potential_paths = [
+                model_dir / f"pytorch_model_{load_key}.pt",
+                model_dir / "diffusion_pytorch_model.safetensors",
+            ]
+            found = False
+            for p in potential_paths:
+                if p.is_file():
+                    load_path = p
+                    found = True
+                    logger.info(f"Found legacy weight file: {load_path}")
+                    break
+            if not found:
+                load_path = files[0] # Fallback
+                logger.warning(f"Could not find standard legacy weight names in {model_dir}, loading first found file: {load_path}")
+
+
+        if load_path is None:
+            raise ValueError("Could not determine a valid model weight path to load.")
+
+        # --- Loading Logic ---
+        if is_sharded:
+            # Load FSDP Sharded Checkpoint
+            model_state_dir = load_path / "model_sharded_state"
+            logger.info(f"Loading FSDP sharded model state from: {model_state_dir}")
+
+            if not isinstance(model, FSDP):
+                 logger.warning("Loading a sharded checkpoint, but the model is not wrapped with FSDP. This might lead to errors or unexpected behavior. Consider wrapping the model with FSDP during initialization if necessary.")
+                 # Attempt loading anyway, but it might fail depending on the model structure
+
+            # Use the SHARDED_STATE_DICT context manager for loading
+            try:
+                with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+                    # Create a dictionary matching the saved structure
+                    model_state_dict_to_load = {"model": model.state_dict()}
+
+                    dist_cp.load_state_dict(
+                        state_dict=model_state_dict_to_load,
+                        storage_reader=dist_cp.FileSystemReader(str(model_state_dir)),
+                        planner=DefaultLoadPlanner(),
+                        no_dist=False # Perform distributed loading
+                    )
+
+                    # Apply the loaded sharded state to the model
+                    model.load_state_dict(model_state_dict_to_load["model"])
+                    logger.info(f"Successfully loaded sharded model state from {model_state_dir}")
+
+            except Exception as e:
+                logger.error(f"Failed to load sharded state dict from {model_state_dir}: {e}")
+                # If FSDP context fails (e.g., model not wrapped), try a direct load approach (less safe)
+                logger.warning("Trying direct state dict loading as fallback (may be incorrect for FSDP)...")
+                try:
+                    # This is less standard for sharded checkpoints but might work in some cases
+                    state_dict = {"model": model.state_dict()} # Get current structure
+                    dist_cp.load_state_dict(
+                        state_dict=state_dict,
+                        storage_reader=dist_cp.FileSystemReader(str(model_state_dir))
+                        )
+                    model.load_state_dict(state_dict["model"]) # Load flattened state directly
+                    logger.info("Successfully loaded sharded state dict using fallback.")
+                except Exception as fallback_e:
+                     logger.error(f"Fallback loading also failed: {fallback_e}")
+                     raise RuntimeError(f"Could not load sharded checkpoint from {model_state_dir}") from e
+
+            # Barrier to ensure all ranks finish loading before proceeding
+            if dist.is_initialized():
+                dist.barrier()
+
+        else:
+            # Load Single File Checkpoint (.pt or .safetensors)
+            logger.info(f"Loading single-file model state from: {load_path}...")
+            if load_path.suffix == ".safetensors":
+                state_dict = safetensors_load_file(str(load_path), device=str(device)) # Load directly to target device if possible
+            elif load_path.suffix == ".pt":
+                state_dict = torch.load(str(load_path), map_location=device) # map_location handles device placement
             else:
-                raise KeyError(
-                    f"Missing key: `{load_key}` in the checkpoint: {model_path}. The keys in the checkpoint "
-                    f"are: {list(state_dict.keys())}.")
-        model.load_state_dict(state_dict, strict=True)
+                raise ValueError(f"Unsupported file format: {load_path}")
+
+            # Handle potential nesting (e.g., {'module': ..., 'ema': ...})
+            bare_model = True
+            if isinstance(state_dict, dict) and ("module" in state_dict or "ema" in state_dict or load_key in state_dict):
+                if load_key in state_dict:
+                    logger.info(f"Extracting state dict with key '{load_key}'")
+                    state_dict = state_dict[load_key]
+                    bare_model = False
+                elif "module" in state_dict: # Common key from DDP or FSDP saves
+                     logger.warning(f"Key '{load_key}' not found, but 'module' key exists. Using 'module' state dict.")
+                     state_dict = state_dict["module"]
+                     bare_model = False
+                # Add more potential keys if needed
+
+            # Check if model is FSDP wrapped, state_dict might need unwrapping if saved from FSDP FullStateDict
+            if isinstance(model, FSDP) and not bare_model:
+                 logger.warning("Model is FSDP wrapped, but loading a potentially nested single-file checkpoint. Ensure the state_dict keys match the FSDP model parameters.")
+                 # FSDP's load_state_dict might handle this automatically if keys match flattened params.
+
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            if missing_keys:
+                logger.warning(f"Missing keys during state_dict load: {missing_keys}")
+            if unexpected_keys:
+                logger.warning(f"Unexpected keys during state_dict load: {unexpected_keys}")
+            logger.info(f"Successfully loaded single-file model state from {load_path}")
+
         return model
 
     @staticmethod

@@ -48,32 +48,6 @@ def custom_collate_fn(batch):
             return batch
 
 
-def check_all_files_exist(video_name, base_dir, output_dir):
-    """
-    检查所有必要的文件是否都已存在
-    
-    Args:
-        video_name (str): 视频名称（不含扩展名）
-        base_dir (Path): 基础目录，包含face_mask、face_emb和audio_emb子目录
-        output_dir (str): 输出目录，包含latent子目录
-        
-    Returns:
-        bool: 如果所有文件都存在返回True，否则返回False
-        dict: 包含各文件路径的字典
-    """
-    # 构建所有需要检查的文件路径
-    paths = {
-        "latent_path": os.path.join(output_dir, "latent", f"{video_name}.pt"),
-        "face_mask_path": os.path.join(base_dir, "face_mask", f"{video_name}.png"),
-        "face_emb_path": os.path.join(base_dir, "face_emb", f"{video_name}.pt"),
-        "audio_emb_path": os.path.join(base_dir, "audio_emb", f"{video_name}.pt")
-    }
-    
-    # 检查所有文件是否都存在
-    all_exist = all(os.path.exists(path) for path in paths.values())
-    
-    return all_exist, paths
-
 
 def validate_data(data):
     """
@@ -189,13 +163,13 @@ def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "latent"), exist_ok=True)
 
-    # 检查是否有已处理的文件
-    processed_files = set()
-    latent_dir = os.path.join(args.output_dir, "latent")
-    for file in os.listdir(latent_dir):
-        if file.endswith(".pt"):
-            processed_files.add(file)
-    logging.info(f"[Rank {local_rank}] 已有 {len(processed_files)} 个处理过的文件")
+    # # 检查是否有已处理的文件
+    # processed_files = set()
+    # latent_dir = os.path.join(args.output_dir, "latent")
+    # for file in os.listdir(latent_dir):
+    #     if file.endswith(".pt"):
+    #         processed_files.add(file)
+    # logging.info(f"[Rank {local_rank}] 已有 {len(processed_files)} 个处理过的文件")
 
     json_data = []
     processed_count = 0
@@ -248,10 +222,16 @@ def main(args):
         with torch.inference_mode():
             with torch.autocast("cuda", dtype=autocast_type):
                 start_time = time.time()
-                latents = vae.encode(data["pixel_values"].to(
-                    encoder_device))["latent_dist"].sample()
-                elapsed_time = time.time() - start_time
-                logging.info(f"[time] {local_rank}:VAE编码和潜在采样完成，耗时 {elapsed_time:.2f} 秒")
+                try:
+                    latents = vae.encode(data["pixel_values"].to(
+                        encoder_device))["latent_dist"].sample()
+                    latents.mul_(vae.config.scaling_factor)
+                    elapsed_time = time.time() - start_time
+                
+                    logging.info(f"[time] {local_rank}:VAE编码和潜在采样完成，耗时 {elapsed_time:.2f} 秒")
+                except Exception as e:
+                    logging.error(f"[Rank {local_rank}] VAE编码和潜在采样时出错: {str(e)}")
+                    continue
             
             for idx in range(len(data["path"])):
                 # 跳过已处理的样本
@@ -352,12 +332,8 @@ def main(args):
                 all_json_data = validate_data(all_json_data)
                 
                 with open(os.path.join(args.output_dir, "videos2caption_temp.json"), "w") as f:
-                    json.dump(all_json_data, f, indent=4)
-                
-                # 保存验证后的数据到最终文件
-                with open(os.path.join(args.output_dir, "videos2caption.json"), "w") as f:
                     json.dump(all_json_data, f, indent=4, ensure_ascii=False)
-                
+
                 logging.info(f"[Rank {local_rank}] 验证后的JSON数据保存成功，共 {len(all_json_data)} 条记录")
             except Exception as e:
                 logging.error(f"[Rank {local_rank}] 保存合并的JSON数据时出错: {str(e)}")

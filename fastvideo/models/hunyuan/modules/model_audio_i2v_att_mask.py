@@ -1,3 +1,4 @@
+from operator import or_
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -14,7 +15,7 @@ from fastvideo.models.hunyuan.modules.posemb_layers import \
 from fastvideo.utils.parallel_states import nccl_info
 
 from .activation_layers import get_activation_layer
-from .attenion import parallel_attention, cross_attention
+from .attenion import parallel_attention, cross_attention, get_cu_seqlens, attention_flash, cross_attention_face_mask
 from .embed_layers import PatchEmbed, TextProjection, TimestepEmbedder, FaceProjModel, AudioProjModel
 from .mlp_layers import MLP, FinalLayer, MLPEmbedder
 from .modulate_layers import ModulateDiT, apply_gate, modulate
@@ -22,8 +23,66 @@ from .norm_layers import get_norm_layer
 from .posemb_layers import apply_rotary_emb
 from .token_refiner import SingleTokenRefiner
 from loguru import logger
+import numpy as np
 
-class MMDoubleStreamBlockAudio(nn.Module):
+
+def get_1d_rotary_pos_embed_riflex(
+    dim: int,
+    pos: Union[np.ndarray, int],
+    theta: float = 10000.0,
+    use_real=False,
+    k: Optional[int] = None,
+    L_test: Optional[int] = None,
+):
+    """
+    RIFLEx: Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+
+    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim' and the end
+    index 'end'. The 'theta' parameter scales the frequencies. The returned tensor contains complex values in complex64
+    data type.
+
+    Args:
+        dim (`int`): Dimension of the frequency tensor.
+        pos (`np.ndarray` or `int`): Position indices for the frequency tensor. [S] or scalar
+        theta (`float`, *optional*, defaults to 10000.0):
+            Scaling factor for frequency computation. Defaults to 10000.0.
+        use_real (`bool`, *optional*):
+            If True, return real part and imaginary part separately. Otherwise, return complex numbers.
+        k (`int`, *optional*, defaults to None): the index for the intrinsic frequency in RoPE
+        L_test (`int`, *optional*, defaults to None): the number of frames for inference
+    Returns:
+        `torch.Tensor`: Precomputed frequency tensor with complex exponentials. [S, D/2]
+    """
+    assert dim % 2 == 0
+
+    if isinstance(pos, int):
+        pos = torch.arange(pos)
+    if isinstance(pos, np.ndarray):
+        pos = torch.from_numpy(pos)  # type: ignore  # [S]
+
+    freqs = 1.0 / (
+            theta ** (torch.arange(0, dim, 2, device=pos.device)[: (dim // 2)].float() / dim)
+    )  # [D/2]
+
+    # === Riflex modification start ===
+    # Reduce the intrinsic frequency to stay within a single period after extrapolation (see Eq. (8)).
+    # Empirical observations show that a few videos may exhibit repetition in the tail frames.
+    # To be conservative, we multiply by 0.9 to keep the extrapolated length below 90% of a single period.
+    if k is not None:
+        freqs[k-1] = 0.9 * 2 * torch.pi / L_test
+    # === Riflex modification end ===
+
+    freqs = torch.outer(pos, freqs)  # type: ignore   # [S, D/2]
+    if use_real:
+        freqs_cos = freqs.cos().repeat_interleave(2, dim=1).float()  # [S, D]
+        freqs_sin = freqs.sin().repeat_interleave(2, dim=1).float()  # [S, D]
+        return freqs_cos, freqs_sin
+    else:
+        # lumina
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64     # [S, D/2]
+        return freqs_cis
+    
+class MMDoubleStreamBlockAudioI2V(nn.Module):
     """
     A multimodal dit block with separate modulation for
     text and image/video, see more details (SD3): https://arxiv.org/abs/2403.03206
@@ -165,11 +224,21 @@ class MMDoubleStreamBlockAudio(nn.Module):
         img: torch.Tensor,
         txt: torch.Tensor,
         vec: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_kv: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_kv: int,
         freqs_cis: tuple = None,
-        text_mask: torch.Tensor = None,
         audio_emb: torch.Tensor = None,
         face_emb: torch.Tensor = None,
+        token_replace_vec: torch.Tensor = None,
+        first_frame_token_num: int = None,
+        text_mask: torch.Tensor = None,
+        face_mask: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        img_mod1, token_replace_img_mod1 = self.img_mod(vec, condition_type="token_replace", \
+                                                            token_replace_vec=token_replace_vec)
         (
             img_mod1_shift,
             img_mod1_scale,
@@ -177,7 +246,15 @@ class MMDoubleStreamBlockAudio(nn.Module):
             img_mod2_shift,
             img_mod2_scale,
             img_mod2_gate,
-        ) = self.img_mod(vec).chunk(6, dim=-1)
+        ) = img_mod1.chunk(6, dim=-1)
+
+
+        (tr_img_mod1_shift,
+        tr_img_mod1_scale,
+        tr_img_mod1_gate,
+        tr_img_mod2_shift,
+        tr_img_mod2_scale,
+        tr_img_mod2_gate) = token_replace_img_mod1.chunk(6, dim=-1)
         (
             txt_mod1_shift,
             txt_mod1_scale,
@@ -189,9 +266,15 @@ class MMDoubleStreamBlockAudio(nn.Module):
 
         # Prepare image for attention.
         img_modulated = self.img_norm1(img)
-        img_modulated = modulate(img_modulated,
-                                 shift=img_mod1_shift,
-                                 scale=img_mod1_scale)
+        # img_modulated = modulate(img_modulated,
+        #                          shift=img_mod1_shift,
+        #                          scale=img_mod1_scale)
+        img_modulated = modulate(
+                img_modulated, shift=img_mod1_shift, scale=img_mod1_scale, condition_type="token_replace",
+                tr_shift=tr_img_mod1_shift, tr_scale=tr_img_mod1_scale,
+                first_frame_token_num=first_frame_token_num
+            )
+            
         img_qkv = self.img_attn_qkv(img_modulated)
         img_q, img_k, img_v = rearrange(img_qkv,
                                         "B L (K H D) -> K B L H D",
@@ -241,14 +324,46 @@ class MMDoubleStreamBlockAudio(nn.Module):
         # logger.info(f"="*80)
         # logger.info(f"parallel attention")
         # logger.info(f"="*80)
-        attn = parallel_attention(
-            (img_q, txt_q),
-            (img_k, txt_k),
-            (img_v, txt_v),
-            img_q_len=img_q.shape[1],
-            img_kv_len=img_k.shape[1],
-            text_mask=text_mask,
-        )
+        # attn = parallel_attention(
+        #     (img_q, txt_q),
+        #     (img_k, txt_k),
+        #     (img_v, txt_v),
+        #     img_q_len=img_q.shape[1],
+        #     img_kv_len=img_k.shape[1],
+        #     text_mask=text_mask,
+        # )
+
+        q = torch.cat((img_q, txt_q), dim=1)
+        k = torch.cat((img_k, txt_k), dim=1)
+        v = torch.cat((img_v, txt_v), dim=1)
+
+        ##########################################  attention mask ##########################################
+        if torch.rand(1).item() < 0.5:
+            attn_mask = torch.cat((face_mask, text_mask), dim=1)
+            attn = attention_flash(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                mode = "vanilla",
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv,
+                batch_size=img_q.shape[0],
+            )
+        else:
+            attn = attention_flash(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            batch_size=img_q.shape[0],
+            )
+        ##########################################  attention mask ##########################################
         # logger.info(f"parallel attention done")
         # logger.info(f"="*80)
 
@@ -257,8 +372,22 @@ class MMDoubleStreamBlockAudio(nn.Module):
         img_attn, txt_attn = attn[:, :img.shape[1]], attn[:, img.shape[1]:]
 
         # Calculate the img blocks.
-        img = img + apply_gate(self.img_attn_proj(img_attn),
-                               gate=img_mod1_gate)
+        # img = img + apply_gate(self.img_attn_proj(img_attn),
+        #                        gate=img_mod1_gate)
+
+        img = img + apply_gate(self.img_attn_proj(img_attn), gate=img_mod1_gate, condition_type="token_replace",
+                                tr_gate=tr_img_mod1_gate, first_frame_token_num=first_frame_token_num)
+        img = img + apply_gate(
+            self.img_mlp(
+                modulate(
+                    self.img_norm2(img), shift=img_mod2_shift, scale=img_mod2_scale, condition_type="token_replace",
+                    tr_shift=tr_img_mod2_shift, tr_scale=tr_img_mod2_scale, first_frame_token_num=first_frame_token_num
+                )
+            ),
+            gate=img_mod2_gate, condition_type="token_replace",
+            tr_gate=tr_img_mod2_gate, first_frame_token_num=first_frame_token_num
+        )
+
 
         audio_emb = self.audio_norm(audio_emb)
         aud_qkv = self.audio_attn_qkv(audio_emb)
@@ -267,12 +396,31 @@ class MMDoubleStreamBlockAudio(nn.Module):
         aud_k = self.audio_attn_k_norm(aud_k).to(aud_v)
         # audio mask
         audio_mask = torch.ones_like(aud_q[:, :, 1, 1])
-        aud_out = cross_attention(
-            (img_q, aud_q),
-            (img_k, aud_k),
-            (img_v, aud_v),
-            text_mask=audio_mask,
-        )
+        # aud_out = cross_attention(
+        #     (img_q, aud_q),
+        #     (img_k, aud_k),
+        #     (img_v, aud_v),
+        #     text_mask=audio_mask,
+        # )
+        ##########################################  attention mask ##########################################
+        if torch.rand(1).item() < 0.5:
+            # 50% 概率用 face-mask 版本
+            aud_out = cross_attention_face_mask(
+                (img_q, aud_q),
+                (img_k, aud_k),
+                (img_v, aud_v),
+                mode="vanilla",
+                attn_mask=face_mask,    # 注意这里变量名要跟你代码一致
+            )
+        else:
+            # 另 50% 概率只用 audio 的 cross_attention
+            aud_out = cross_attention(
+                (img_q, aud_q),
+                (img_k, aud_k),
+                (img_v, aud_v),
+                text_mask=audio_mask,
+            )
+        ##########################################  attention mask ##########################################
 
         max_value = 2
         scale = torch.clamp(self.audio_scale, max=max_value)
@@ -287,20 +435,29 @@ class MMDoubleStreamBlockAudio(nn.Module):
         )
 
         # Calculate the txt blocks.
-        txt = txt + apply_gate(self.txt_attn_proj(txt_attn),
-                               gate=txt_mod1_gate)
+        # txt = txt + apply_gate(self.txt_attn_proj(txt_attn),
+        #                        gate=txt_mod1_gate)
+        # txt = txt + apply_gate(
+        #     self.txt_mlp(
+        #         modulate(self.txt_norm2(txt),
+        #                  shift=txt_mod2_shift,
+        #                  scale=txt_mod2_scale)),
+        #     gate=txt_mod2_gate,
+        # )
+        txt = txt + apply_gate(self.txt_attn_proj(txt_attn), gate=txt_mod1_gate)
         txt = txt + apply_gate(
             self.txt_mlp(
-                modulate(self.txt_norm2(txt),
-                         shift=txt_mod2_shift,
-                         scale=txt_mod2_scale)),
+                modulate(
+                    self.txt_norm2(txt), shift=txt_mod2_shift, scale=txt_mod2_scale
+                )
+            ),
             gate=txt_mod2_gate,
         )
 
         return img, txt
 
 
-class MMSingleStreamBlockAudio(nn.Module):
+class MMSingleStreamBlockAudioI2V(nn.Module):
     """
     A DiT block with parallel linear layers as described in
     https://arxiv.org/abs/2302.05442 and adapted modulation interface.
@@ -399,13 +556,33 @@ class MMSingleStreamBlockAudio(nn.Module):
         x: torch.Tensor,
         vec: torch.Tensor,
         txt_len: int,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_kv: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_kv: int,
         freqs_cis: Tuple[torch.Tensor, torch.Tensor] = None,
-        text_mask: torch.Tensor = None,
         audio_emb: torch.Tensor = None,
         face_emb: torch.Tensor = None,
+        token_replace_vec: torch.Tensor = None,
+        first_frame_token_num: int = None,
+        text_mask: torch.Tensor = None,
+        face_mask: torch.Tensor = None,
     ) -> torch.Tensor:
-        mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
-        x_mod = modulate(self.pre_norm(x), shift=mod_shift, scale=mod_scale)
+        mod, tr_mod = self.modulation(vec,
+                                          condition_type="token_replace",
+                                          token_replace_vec=token_replace_vec)
+        (mod_shift,
+        mod_scale,
+        mod_gate) = mod.chunk(3, dim=-1)
+        (tr_mod_shift,
+        tr_mod_scale,
+        tr_mod_gate) = tr_mod.chunk(3, dim=-1)
+        # mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
+
+        x_mod = modulate(self.pre_norm(x), shift=mod_shift, scale=mod_scale, condition_type="token_replace",
+                             tr_shift=tr_mod_shift, tr_scale=tr_mod_scale, first_frame_token_num=first_frame_token_num)
+        
+        # x_mod = modulate(self.pre_norm(x), shift=mod_shift, scale=mod_scale)
         qkv, mlp = torch.split(self.linear1(x_mod),
                                [3 * self.hidden_size, self.mlp_hidden_dim],
                                dim=-1)
@@ -440,18 +617,47 @@ class MMSingleStreamBlockAudio(nn.Module):
         img_q, img_k = img_qq, img_kk
 
         # print(f"img_q shape: {img_q.shape}, txt_q shape: {txt_q.shape}, img_k shape: {img_k.shape}, txt_k shape: {txt_k.shape}")
-        attn = parallel_attention(
-            (img_q, txt_q),
-            (img_k, txt_k),
-            (img_v, txt_v),
-            img_q_len=img_q.shape[1],
-            img_kv_len=img_k.shape[1],
-            text_mask=text_mask,
-        )
+        # attn = parallel_attention(
+        #     (img_q, txt_q),
+        #     (img_k, txt_k),
+        #     (img_v, txt_v),
+        #     img_q_len=img_q.shape[1],
+        #     img_kv_len=img_k.shape[1],
+        #     text_mask=text_mask,
+        # )
+        q = torch.cat((img_q, txt_q), dim=1)
+        k = torch.cat((img_k, txt_k), dim=1)
+        v = torch.cat((img_v, txt_v), dim=1)
+        
+        ##########################################  attention mask ##########################################
+        if torch.rand(1).item() < 0.5:
+            attn_mask = torch.cat((face_mask, text_mask), dim=1)
+            attn = attention_flash(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                mode = "vanilla",
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv,
+                batch_size=img_q.shape[0],
+            )
+        else:
+            attn = attention_flash(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            batch_size=img_q.shape[0],
+            )
+        ##########################################  attention mask ##########################################
 
         img_attn, txt_attn = attn[:, :img_q.shape[1]], attn[:, img_q.shape[1]:]
-
-        # print(f"img_attn shape: {img_attn.shape}, txt_attn shape: {txt_attn.shape}")
 
         # audio cross attention
         # print(f"audio_emb shape: {audio_emb.shape}")
@@ -465,37 +671,58 @@ class MMSingleStreamBlockAudio(nn.Module):
         aud_k = self.audio_attn_k_norm(aud_k).to(aud_v)
         audio_mask = torch.ones_like(aud_q[:, :, 1, 1])
         
-        aud_out = cross_attention(
-            (img_q, aud_q),
-            (img_k, aud_k),
-            (img_v, aud_v),
-            text_mask=audio_mask,
-        )
+        # aud_out = cross_attention(
+        #     (img_q, aud_q),
+        #     (img_k, aud_k),
+        #     (img_v, aud_v),
+        #     text_mask=audio_mask,
+        # )
+
+        ##########################################  attention mask ##########################################
+        if torch.rand(1).item() < 0.5:
+            # 50% 概率用 face-mask 版本
+            aud_out = cross_attention_face_mask(
+                (img_q, aud_q),
+                (img_k, aud_k),
+                (img_v, aud_v),
+                mode="vanilla",
+                attn_mask=face_mask,    # 注意这里变量名要跟你代码一致
+            )
+        else:
+            # 另 50% 概率只用 audio 的 cross_attention
+            aud_out = cross_attention(
+                (img_q, aud_q),
+                (img_k, aud_k),
+                (img_v, aud_v),
+                text_mask=audio_mask,
+            )
+        ##########################################  attention mask ##########################################
 
         # print(f"aud_out shape: {aud_out.shape}")
         max_value = 2
         scale = torch.clamp(self.audio_scale, max=max_value)
-        img_attn = img_attn + aud_out * scale
 
-        # print(f"img_attn shape: {img_attn.shape}, txt_attn shape: {txt_attn.shape}")
+        img_attn = img_attn + aud_out * scale
 
         attn = torch.cat((img_attn, txt_attn), dim=1)
 
-        # print(f"attn shape: {attn.shape}")
-
         # Compute activation in mlp stream, cat again and run second linear layer.
-        output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
-        output = x + apply_gate(output, gate=mod_gate)
+        # output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        # output = x + apply_gate(output, gate=mod_gate)
+        # Let's rename 'output' used as input to apply_gate to avoid confusion
+        inner_output_for_gate = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
 
+        # Original line 488, using the renamed variable
+        # output = x + apply_gate(inner_output_for_gate, gate=mod_gate)
+        output = x + apply_gate(inner_output_for_gate, gate=mod_gate, condition_type="token_replace",
+                                tr_gate=tr_mod_gate, first_frame_token_num=first_frame_token_num)
         # attention computation end
-
-        
 
         return output
 
 
 
-class HYVideoDiffusionTransformerAudio(ModelMixin, ConfigMixin):
+class HYVideoDiffusionTransformerAudioI2V(ModelMixin, ConfigMixin):
     """
     HunyuanVideo Transformer backbone
 
@@ -638,7 +865,7 @@ class HYVideoDiffusionTransformerAudio(ModelMixin, ConfigMixin):
 
         # double blocks
         self.double_blocks = nn.ModuleList([
-            MMDoubleStreamBlockAudio(
+            MMDoubleStreamBlockAudioI2V(
                 self.hidden_size,
                 self.heads_num,
                 mlp_width_ratio=mlp_width_ratio,
@@ -652,7 +879,7 @@ class HYVideoDiffusionTransformerAudio(ModelMixin, ConfigMixin):
 
         # single blocks
         self.single_blocks = nn.ModuleList([
-            MMSingleStreamBlockAudio(
+            MMSingleStreamBlockAudioI2V(
                 self.hidden_size,
                 self.heads_num,
                 mlp_width_ratio=mlp_width_ratio,
@@ -727,6 +954,7 @@ class HYVideoDiffusionTransformerAudio(ModelMixin, ConfigMixin):
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = False,
         guidance=None,
+        face_mask: torch.Tensor = None, # 新增
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         if guidance is None:
             guidance = torch.tensor([6016.0],
@@ -752,21 +980,6 @@ class HYVideoDiffusionTransformerAudio(ModelMixin, ConfigMixin):
             # logger.info(f"audio_emb shape after rearrange: {audio_emb.shape}")
             # logger.info(f"="*80)
 
-        # if face_emb is not None:
-        #     # logger.info(f"face_emb shape before proj: {face_emb.shape}")
-        #     print("="*80)
-        #     print(f"face_emb shape before proj: {face_emb.shape}")
-        #     print("="*80)
-        #     face_emb = face_emb.unsqueeze(1)
-        #     face_emb = self.face_proj(face_emb)
-        #     print("="*80)
-        #     print(f"face_emb shape after proj: {face_emb.shape}")
-        #     print("="*80)
-        #     face_emb = face_emb.unsqueeze(1).repeat(1, frame_num, 1, 1)
-        #     face_emb = rearrange(face_emb, "b f d c -> (b f) d c")
-        #     print("="*80)
-        #     print(f"face_emb shape after rearrange: {face_emb.shape}")
-        #     print("="*80)
 
             # logger.info(f"face_emb shape after proj: {face_emb.shape}")
             # logger.info(f"="*80)
@@ -782,6 +995,7 @@ class HYVideoDiffusionTransformerAudio(ModelMixin, ConfigMixin):
             ow // self.patch_size[2],  # codespell:ignore
         )
         original_tt = nccl_info.sp_size * tt
+
         freqs_cos, freqs_sin = self.get_rotary_pos_embed((original_tt, th, tw))
         # Prepare modulation vectors.
         vec = self.time_in(t)
@@ -799,6 +1013,10 @@ class HYVideoDiffusionTransformerAudio(ModelMixin, ConfigMixin):
             # our timestep_embedding is merged into guidance_in(TimestepEmbedder)
             vec = vec + self.guidance_in(guidance)
 
+        token_replace_t = torch.zeros_like(t)
+        token_replace_vec = self.time_in(token_replace_t)
+        first_frame_token_num = th * tw
+
         # Embed image and text.
         img = self.img_in(img) # [b, patch_dim, hid]
         if self.text_projection == "linear":
@@ -813,11 +1031,22 @@ class HYVideoDiffusionTransformerAudio(ModelMixin, ConfigMixin):
         txt_seq_len = txt.shape[1]
         img_seq_len = img.shape[1]
 
+        # Compute cu_squlens and max_seqlen for flash attention
+        cu_seqlens_q = get_cu_seqlens(text_mask, img_seq_len)
+        cu_seqlens_kv = cu_seqlens_q
+        max_seqlen_q = img_seq_len + txt_seq_len
+        max_seqlen_kv = max_seqlen_q
+
+
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
         # --------------------- Pass through DiT blocks ------------------------
         # 修改double blocks的参数传递,添加audio_emb和face_emb
+
         for _, block in enumerate(self.double_blocks):
-            double_block_args = [img, txt, vec, freqs_cis, text_mask, audio_emb, face_emb]
+            ####################################################################################### attention mask #######################################################################################
+            double_block_args = [img, txt, vec, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, freqs_cis, audio_emb, face_emb, token_replace_vec, first_frame_token_num, text_mask,face_mask]
+            ####################################################################################### attention mask #######################################################################################
+            # double_block_args = [img, txt, vec, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, freqs_cis, audio_emb, face_emb, token_replace_vec, first_frame_token_num]
             img, txt = block(*double_block_args)
 
 
@@ -830,19 +1059,29 @@ class HYVideoDiffusionTransformerAudio(ModelMixin, ConfigMixin):
         logger.info(f"single blocks inference")
         logger.info(f"="*80)
         if len(self.single_blocks) > 0:
+            ################## attention mask ###################
             for _, block in enumerate(self.single_blocks):
                 single_block_args = [
                     x,
                     vec,
                     txt_seq_len,
+                    cu_seqlens_q,
+                    cu_seqlens_kv,
+                    max_seqlen_q,
+                    max_seqlen_kv,
                     (freqs_cos, freqs_sin),
-                    text_mask,
                     audio_emb,
-                    face_emb
+                    face_emb,
+                    token_replace_vec,
+                    first_frame_token_num,
+                    text_mask,
+                    face_mask
                 ]
                 x = block(*single_block_args)
                 if output_features and _ % output_features_stride == 0:
                     features_list.append(x[:, :img_seq_len, ...])
+            ################## attention mask ###################
+
         logger.info(f"="*80)
         logger.info(f"single blocks inference done")
         logger.info(f"="*80)
@@ -923,5 +1162,13 @@ HUNYUAN_VIDEO_CONFIG = {
         "heads_num": 24,
         "mlp_width_ratio": 4,
         "guidance_embed": True,
+    },
+    "HYVideo-S/2": {
+        "mm_double_blocks_depth": 6,
+        "mm_single_blocks_depth": 12,
+        "rope_dim_list": [12, 42, 42],
+        "hidden_size": 480,
+        "heads_num": 5,
+        "mlp_width_ratio": 4,
     },
 }

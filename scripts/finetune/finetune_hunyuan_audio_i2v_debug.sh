@@ -8,40 +8,63 @@ nproc_per_node=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 sp_size=1
 
 DATA_NAME="200_hour_480p_49frames_eng"
-EXPERIMENT_NAME="Hunyuan-Audio-Finetune-Hunyuan-audio-only-49frames-${DATA_NAME}"
-LOG_DIR="./logs/model_training/${EXPERIMENT_NAME}.log"
+EXPERIMENT_NAME="Hunyuan-Audio-Finetune-Hunyuan-ai2v-49frames-${DATA_NAME}-0503-debug-yexin"
+LOG_DIR="/data/nas/yexin/workspace/shunian/model_training/FastVideo/logs/model_training/${EXPERIMENT_NAME}.log"
 OUTPUT_DIR="./data/outputs/${EXPERIMENT_NAME}"
 mkdir -p $(dirname $LOG_DIR)
 mkdir -p $(dirname $OUTPUT_DIR)
 
+te_params=" \
+    --vae-model-name-or-path /data/nas/yexin/workspace/shunian/model/ \
+    --vae-precision fp16 \
+    --text-encoder llm-i2v \
+    --text-encoder-precision fp16 \
+    --text-states-dim 4096 \
+    --text-len 256 \
+    --tokenizer llm-i2v \
+    --prompt-template dit-llm-encode-i2v \
+    --prompt-template-video dit-llm-encode-video-i2v \
+    --hidden-state-skip-layer 2 \
+    --text-encoder-2 clipL \
+    --text-encoder-precision-2 fp16 \
+    --text-states-dim-2 768 \
+    --tokenizer-2 clipL \
+    --text-len-2 77 \
+    --i2v-mode \
+    --reproduce \
+    "
+
 # echo "启动训练，只训练音频相关参数..."
 
+export MODEL_BASE="/data/nas/yexin/workspace/shunian/model"
+
 torchrun --nnodes 1 --nproc_per_node $nproc_per_node \
-    fastvideo/train_audio.py \
+    --master_port 29509 \
+    fastvideo/train_audio_i2v.py \
     --seed 42 \
     --pretrained_model_name_or_path /sds_wangby/models/HunyuanVideo/HunyuanVideo \
-    --dit_model_name_or_path /data/nas/yexin/workspace/shunian/model/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt\
-    --model_type "hunyuan_audio" \
+    --dit_model_name_or_path ${MODEL_BASE}/hunyuan-video-i2v-720p/transformers/mp_rank_00_model_states.pt\
+    --model_type "hunyuan_audio_i2v" \
     --cache_dir data/.cache \
-    --data_json_path data/${DATA_NAME}/videos2caption.json \
+    --data_json_path data/${DATA_NAME}/debug_data_8.json \
     --validation_prompt_dir data/Image-Vid-Finetune-HunYuan/validation \
     --gradient_checkpointing \
     --train_batch_size=1 \
     --num_latent_t 32 \
     --sp_size $sp_size \
     --train_sp_batch_size 1 \
-    --dataloader_num_workers 0 \
-    --gradient_accumulation_steps=32 \
+    --dataloader_num_workers 8 \
+    --gradient_accumulation_steps=1 \
     --max_train_steps=3000 \
-    --learning_rate=2e-5 \
+    --learning_rate=1e-5 \
     --mixed_precision=bf16 \
-    --checkpointing_steps=100 \
+    --checkpointing_steps=50 \
     --validation_steps 3000 \
     --validation_sampling_steps 50 \
     --checkpoints_total_limit 3 \
     --allow_tf32 \
     --ema_start_step 0 \
-    --cfg 0.0 \
+    --cfg 0 \
     --ema_decay 0.999 \
     --log_validation \
     --output_dir=${OUTPUT_DIR} \
@@ -54,4 +77,5 @@ torchrun --nnodes 1 --nproc_per_node $nproc_per_node \
     --master_weight_type bf16 \
     --train_audio_only \
     --resume_from_checkpoint "auto" \
+    ${te_params} \
     > ${LOG_DIR} 2>&1

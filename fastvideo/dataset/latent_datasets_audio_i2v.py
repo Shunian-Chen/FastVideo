@@ -13,16 +13,13 @@ from fastvideo.models.hunyuan.constants import PROMPT_TEMPLATE, PRECISION_TO_TYP
 import torchvision.transforms as transforms
 from typing import List
 import PIL
+from fastvideo.models.hunyuan.constants import BACKGROUND_VALUE, FACE_MASK_VALUE, LIP_MASK_VALUE
 
 
 ## 不显示info级别的日志
 logger.remove()
 logger.add(sys.stdout, level="WARNING")
 
-# 添加用于重建 mask 的常量
-BACKGROUND_VALUE = 0.1
-FACE_MASK_VALUE = 0.5
-LIP_MASK_VALUE = 1.0
 
 def numpy_to_pil(images: np.ndarray) -> List[PIL.Image.Image]:
     if images.ndim == 3:
@@ -54,8 +51,8 @@ def get_cond_images(args, latents, vae, is_uncond=False):
         sematic_image_latents = latents
     sematic_image_latents = 1 / vae.config.scaling_factor * sematic_image_latents.to(vae.device)
 
-    print(f"sematic_image_latents device: {sematic_image_latents.device}")
-    print(f"vae device: {vae.device}")
+    # print(f"sematic_image_latents device: {sematic_image_latents.device}")
+    # print(f"vae device: {vae.device}")
     semantic_images = vae.decode(
         sematic_image_latents, return_dict=False
     )[0]
@@ -90,16 +87,16 @@ def get_cond_latents(args, latents, vae):
         first_image_latents = latents
     
     # breakpoint()
-    print(f"first_image_latents device before: {first_image_latents.device}")
-    print(f"vae device before: {vae.device}")
+    # print(f"first_image_latents device before: {first_image_latents.device}")
+    # print(f"vae device before: {vae.device}")
     first_image_latents = 1 / vae.config.scaling_factor * first_image_latents.to(vae.device)
 
     # print(f"latents shape: {latents.shape}, dtype: {latents.dtype}")
     # print(f"first image latents shape: {first_image_latents.shape}, dtype: {first_image_latents.dtype}")
     # print(f"first image latents shape after unsqueeze: {first_image_latents.unsqueeze(1).shape}, dtype: {first_image_latents.unsqueeze(2).dtype}")
 
-    print(f"first_image_latents device: {first_image_latents.device}")
-    print(f"vae device: {vae.device}")
+    # print(f"first_image_latents device: {first_image_latents.device}")
+    # print(f"vae device: {vae.device}")
     first_images = vae.decode(
         first_image_latents, return_dict=False
     )[0]
@@ -109,7 +106,7 @@ def get_cond_latents(args, latents, vae):
     elif len(first_images.shape) == 4:
         first_images = first_images.squeeze(1)
     
-    print(f"first image shape: {first_images.shape}, dtype: {first_images.dtype}")
+    # print(f"first image shape: {first_images.shape}, dtype: {first_images.dtype}")
     first_images = (first_images / 2 + 0.5).clamp(0, 1)
     first_images = first_images.cpu().permute(0, 2, 3, 1).float().numpy()
     first_images = numpy_to_pil(first_images)
@@ -125,7 +122,7 @@ def get_cond_latents(args, latents, vae):
     first_images_pixel_values = (
         torch.cat(first_images_pixel_values).unsqueeze(0).unsqueeze(2).to(vae.device)
     )
-    print(f"first_images_pixel_values shape: {first_images_pixel_values.shape}, dtype: {first_images_pixel_values.dtype}")
+    # print(f"first_images_pixel_values shape: {first_images_pixel_values.shape}, dtype: {first_images_pixel_values.dtype}")
     vae_dtype = PRECISION_TO_TYPE[args.vae_precision]
     with torch.autocast(
         device_type="cuda", dtype=vae_dtype, enabled=vae_dtype != torch.float32
@@ -134,11 +131,26 @@ def get_cond_latents(args, latents, vae):
             first_images_pixel_values
         ).latent_dist.sample()  # B, C, F, H, W
         cond_latents.mul_(vae.config.scaling_factor)
-        cond_latents = cond_latents.squeeze(0)
 
-
-    print(f"cond_latents shape: {cond_latents.shape}, dtype: {cond_latents.dtype}")
+    # print(f"cond_latents shape: {cond_latents.shape}, dtype: {cond_latents.dtype}")
     return cond_latents
+
+
+def get_text_tokens(text_encoder, description):
+    text_inputs = text_encoder.text2tokens(description, data_type='video')
+    text_ids = text_inputs["input_ids"]
+    text_mask = text_inputs["attention_mask"]
+    return text_ids, text_mask
+
+def get_text_hidden_states(text_encoder, text_ids, text_mask, semantic_images):
+    text_outputs = text_encoder.encode(
+            {"input_ids": text_ids, "attention_mask": text_mask},
+            data_type="video",
+            semantic_images=semantic_images,
+        )
+    text_states = text_outputs.hidden_state
+    text_mask = text_outputs.attention_mask
+    return text_states, text_mask
 
 class LatentDatasetAudio_i2v(Dataset):
 
@@ -146,14 +158,9 @@ class LatentDatasetAudio_i2v(Dataset):
         self,
         json_path,
         num_latent_t,
-        cfg_rate,
-        vae,
-        text_encoder,
-        args,
     ):
         # data_merge_path: video_dir, latent_dir, prompt_embed_dir, json_path
         self.json_path = json_path
-        self.cfg_rate = cfg_rate
         self.datase_dir_path = os.path.dirname(json_path)
         self.video_dir = os.path.join(self.datase_dir_path, "video")
         self.latent_dir = os.path.join(self.datase_dir_path, "latent")
@@ -179,28 +186,6 @@ class LatentDatasetAudio_i2v(Dataset):
             for data_item in self.data_anno
         ]
 
-        self.text_encoder = text_encoder
-
-        self.vae = vae
-        self.args = args
-
-    @staticmethod
-    def get_text_tokens(text_encoder, description):
-        text_inputs = text_encoder.text2tokens(description, data_type='video')
-        text_ids = text_inputs["input_ids"]
-        text_mask = text_inputs["attention_mask"]
-        return text_ids, text_mask
-
-    def get_text_hidden_states(self, text_encoder, text_ids, text_mask, semantic_images):
-        text_outputs = text_encoder.encode(
-                {"input_ids": text_ids, "attention_mask": text_mask},
-                data_type="video",
-                semantic_images=semantic_images,
-            )
-        text_states = text_outputs.hidden_state
-        text_mask = text_outputs.attention_mask
-        return text_states, text_mask
-
     def process_audio_emb(self, audio_emb):
         concatenated_tensors = []
 
@@ -217,12 +202,13 @@ class LatentDatasetAudio_i2v(Dataset):
 
     def __getitem__(self, idx):
         latent_file = self.data_anno[idx]["latent_path"]
+        # print("latent_file",latent_file)
         # prompt_embed_file = self.data_anno[idx]["prompt_embed_path"]
         # prompt_attention_mask_file = self.data_anno[idx][
         #     "prompt_attention_mask"]
         # 获取audio和face embedding文件路径
+        sample_id = self.data_anno[idx]["latent_path"].split('.')[0]
         audio_embed_file = self.data_anno[idx].get("audio_emb_path")
-        face_embed_file = self.data_anno[idx].get("face_emb_path")
         # 获取 face mask 文件路径 (现在是坐标文件)
         face_mask_coord_file = self.data_anno[idx].get("face_emb_path") # 假设文件名与 face_emb 相同，只是在不同目录
         if face_mask_coord_file:
@@ -243,47 +229,13 @@ class LatentDatasetAudio_i2v(Dataset):
             weights_only=True,
         )
         latent = latent.squeeze(0)[:, -self.num_latent_t:]
-        cond_latents = get_cond_latents(self.args, latent, self.vae)
+        # cond_latents = get_cond_latents(self.args, latent, self.vae)
         
-        is_uncond = (
-            torch.tensor(1).to(torch.int64)
-            if random.random() < self.args.sematic_cond_drop_p
-            else torch.tensor(0).to(torch.int64)
-        )
-
-        semantic_images = get_cond_images(self.args, cond_latents, self.vae, is_uncond=is_uncond)
-
-
-        # load prompt
-        if random.random() < self.cfg_rate:
-            prompt_embed = self.uncond_prompt_embed
-            prompt_attention_mask = self.uncond_prompt_mask
-        else:
-            prompt_tokens, prompt_attention_mask = self.get_text_tokens(self.text_encoder, self.data_anno[idx]["caption"])
-            prompt_embed, prompt_attention_mask = self.get_text_hidden_states(self.text_encoder, prompt_tokens, prompt_attention_mask, semantic_images)
-
-            # prompt_embed = torch.load(
-            #     os.path.join(self.prompt_embed_dir, prompt_embed_file),
-            #     map_location="cpu",
-            #     weights_only=True,
-            # )
-            # # Define path for potential error message
-            # prompt_attention_mask_path = os.path.join(self.prompt_attention_mask_dir, prompt_attention_mask_file)
-            # try:
-            #     prompt_attention_mask = torch.load(
-            #         prompt_attention_mask_path,
-            #         map_location="cpu",
-            #         weights_only=True,
-            #     )
-            # except Exception as e:
-            #     logger.warning(f"Failed to load prompt attention mask {prompt_attention_mask_path}: {e}. Creating a fallback mask.")
-            #     # Fallback: Create a boolean mask of ones with the same first dimension size as prompt_embed
-            #     prompt_attention_mask = torch.ones(prompt_embed.shape[0]-1, dtype=torch.bool, device="cpu")
-        
+        caption = self.data_anno[idx]["caption"]
+        # print(f"caption in data anno: {caption}")
 
         # 加载 audio 和 face embeddings
         audio_embed = None
-        face_embed = None
         if audio_embed_file:
             audio_embed_path = os.path.join(self.audio_embed_dir, audio_embed_file)
             if os.path.exists(audio_embed_path):
@@ -292,227 +244,271 @@ class LatentDatasetAudio_i2v(Dataset):
                 audio_embed = self.process_audio_emb(audio_embed)
             else: logger.warning(f"Audio embed file not found: {audio_embed_path}")
 
-        if face_embed_file:
-            face_embed_path = os.path.join(self.face_embed_dir, face_embed_file)
-            if os.path.exists(face_embed_path):
-                face_embed = torch.load(face_embed_path, map_location="cpu", weights_only=False)
-                if not isinstance(face_embed, torch.Tensor): face_embed = torch.as_tensor(face_embed)
-            else: 
-                face_embed = torch.ones(512)  # 创建512维全1张量
-                # logger.warning(f"Face embed file not found: {face_embed_path}")
-
-
         # 加载和重建 face_mask
         face_mask = None
         if face_mask_coord_path and os.path.exists(face_mask_coord_path):
             try:
                 # 加载坐标数据字典
-                mask_data = torch.load(face_mask_coord_path, map_location="cpu")
+                mask_data = torch.load(face_mask_coord_path, map_location="cpu", weights_only=True)
 
                 # 检查加载的数据格式
-                if isinstance(mask_data, dict) and "original_height" in mask_data and "frames" in mask_data:
-                    original_h = mask_data["original_height"]
-                    original_w = mask_data["original_width"]
-                    frame_coords_list = mask_data["frames"]
-                    num_frames_in_file = len(frame_coords_list)
+                # if isinstance(mask_data, dict) and "original_height" in mask_data and "frames" in mask_data:
+                original_h = mask_data["original_height"]
+                original_w = mask_data["original_width"]
+                frame_coords_list = mask_data["frames"]
+                num_frames_in_file = len(frame_coords_list)
 
-                    # 获取目标 latent 形状
-                    num_latent_ch, num_latent_t_actual, target_h, target_w = latent.shape # 使用 latent 的实际 t 维度
+                # 获取目标 latent 形状
+                num_latent_ch, num_latent_t_actual, target_h, target_w = latent.shape # 使用 latent 的实际 t 维度
 
-                    # --- 重建 mask ---
-                    reconstructed_masks = []
-                    # 遍历坐标文件中的所有帧数据
-                    for t_idx in range(num_frames_in_file): # <-- 使用 num_frames_in_file
-                        # 创建单帧 mask (原始尺寸), 初始化为背景值
-                        single_frame_mask = torch.full((original_h, original_w), BACKGROUND_VALUE, dtype=torch.float32)
+                # --- 重建 mask ---
+                reconstructed_masks = []
+                # 遍历坐标文件中的所有帧数据
+                for t_idx in range(num_frames_in_file): # <-- 使用 num_frames_in_file
+                    # 创建单帧 mask (原始尺寸), 初始化为背景值
+                    single_frame_mask = torch.full((original_h, original_w), BACKGROUND_VALUE, dtype=torch.float32)
 
-                        # 确定从哪个坐标帧获取数据
-                        # coord_idx = min(t_idx, num_frames_in_file - 1) if num_frames_in_file > 0 else -1 # No longer needed as we loop through num_frames_in_file
-                        coord_idx = t_idx # Direct index
+                    # 确定从哪个坐标帧获取数据
+                    # coord_idx = min(t_idx, num_frames_in_file - 1) if num_frames_in_file > 0 else -1 # No longer needed as we loop through num_frames_in_file
+                    coord_idx = t_idx # Direct index
 
-                        if coord_idx >= 0 and frame_coords_list[coord_idx] is not None:
-                            coords = frame_coords_list[coord_idx]
-                             # 确保 coords 包含8个值，否则认为是无效的
-                            if len(coords) == 8:
-                                fx1, fy1, fx2, fy2, lx1, ly1, lx2, ly2 = coords
+                    if coord_idx >= 0 and frame_coords_list[coord_idx] is not None:
+                        coords = frame_coords_list[coord_idx]
+                            # 确保 coords 包含8个值，否则认为是无效的
+                        if len(coords) == 8:
+                            fx1, fy1, fx2, fy2, lx1, ly1, lx2, ly2 = coords
 
-                                # 填充面部区域 (确保坐标有效)
-                                if fx2 > fx1 and fy2 > fy1:
-                                    single_frame_mask[fy1:fy2, fx1:fx2] = FACE_MASK_VALUE
+                            # 填充面部区域 (确保坐标有效)
+                            if fx2 > fx1 and fy2 > fy1:
+                                single_frame_mask[fy1:fy2, fx1:fx2] = FACE_MASK_VALUE
 
-                                # 填充唇部区域 (确保坐标有效)
-                                if lx2 > lx1 and ly2 > ly1:
-                                    single_frame_mask[ly1:ly2, lx1:lx2] = LIP_MASK_VALUE
-                            else:
-                                logger.warning(f"Invalid coordinate format in frame {coord_idx} of {face_mask_coord_path}. Expected 8 values, got {len(coords)}. Using background mask for this frame.")
-                        # else: 如果 coord_idx < 0 或 frame_coords_list[coord_idx] is None, mask 保持为背景值
+                            # 填充唇部区域 (确保坐标有效)
+                            if lx2 > lx1 and ly2 > ly1:
+                                single_frame_mask[ly1:ly2, lx1:lx2] = LIP_MASK_VALUE
+                        else:
+                            logger.warning(f"Invalid coordinate format in frame {coord_idx} of {face_mask_coord_path}. Expected 8 values, got {len(coords)}. Using background mask for this frame.")
+                    # else: 如果 coord_idx < 0 或 frame_coords_list[coord_idx] is None, mask 保持为背景值
 
-                        reconstructed_masks.append(single_frame_mask)
+                    reconstructed_masks.append(single_frame_mask)
 
-                    if not reconstructed_masks:
-                         logger.warning(f"未能重建任何 mask 帧 {face_mask_coord_path}. Using ones mask.")
-                         face_mask = torch.ones(num_latent_ch, num_latent_t_actual, target_h, target_w) # Fallback
-                    else:
-                        face_mask = torch.stack(reconstructed_masks, dim=0) # Shape: [num_frames_in_file, H_orig, W_orig]
-                        current_t, current_h, current_w = face_mask.shape[0], face_mask.shape[1], face_mask.shape[2]
-
-                        # --- 新增：Center Crop 到 8x latent size ---
-                        target_crop_h = target_h * 8
-                        target_crop_w = target_w * 8
-
-                        if current_h != target_crop_h or current_w != target_crop_w:
-                            if current_h >= target_crop_h and current_w >= target_crop_w:
-                                crop_y = (current_h - target_crop_h) // 2
-                                crop_x = (current_w - target_crop_w) // 2
-                                face_mask = face_mask[:, crop_y : crop_y + target_crop_h, crop_x : crop_x + target_crop_w] # Crop H, W dims
-                                logger.debug(f"Cropped mask from {current_h, current_w} to {target_crop_h, target_crop_w}")
-                                current_h, current_w = face_mask.shape[1], face_mask.shape[2] # Update current size after crop
-                            else:
-                                logger.warning(f"Original mask size ({current_h}, {current_w}) is smaller than target crop size ({target_crop_h, target_crop_w}). Skipping crop before interpolate.")
-                        # --- 结束 Center Crop ---
-
-                        # --- 调整尺寸和维度以匹配 latent (包括时间维度插值) ---
-                        # 准备进行 3D 插值 (D, H, W) -> (T_latent, target_h, target_w)
-                        # interpolate 需要 [N, C, D, H, W]
-                        face_mask = face_mask.unsqueeze(0).unsqueeze(0) # [1, 1, T_file, H_crop, W_crop]
-
-                        # 插值到目标尺寸 [T_latent, target_h, target_w]
-                        face_mask = torch.nn.functional.interpolate(
-                            face_mask,
-                            size=(num_latent_t_actual, target_h, target_w), # Interpolate T, H, W
-                            mode='trilinear', # Use trilinear for 3D interpolation
-                            align_corners=False # Typically False for spatial dims, consider if True needed for time
-                        ) # [1, 1, T_latent, target_h, target_w]
-
-                        # 移除 N 和 C 维度
-                        face_mask = face_mask.squeeze(0).squeeze(0) # [T_latent, target_h, target_w]
-
-                        # 扩展/重复通道维度以匹配 latent [ch, t, target_h, target_w]
-                        face_mask = face_mask.unsqueeze(0).repeat(num_latent_ch, 1, 1, 1) # [ch, T_latent, target_h, target_w]
-
-                        # 保持原始 mask 值 (0.1, 0.5, 1.0) 以便后续可能的不同处理
-                        # face_mask = (face_mask >= FACE_MASK_VALUE).float()
-
-
-                elif isinstance(mask_data, torch.Tensor): # 兼容旧的 Tensor 格式 (.pt 文件)
-                     logger.warning(f"Loaded face_mask is an old Tensor format: {face_mask_coord_path}. Applying direct interpolation (no 8x crop).")
-                     face_mask = mask_data
-                     if face_mask.dtype != torch.float32:
-                         face_mask = face_mask.float()
-
-                     # 预期维度是 [t, h, w]
-                     if face_mask.ndim != 3:
-                         logger.warning(f"Loaded .pt face_mask has unexpected dimensions: {face_mask.shape}. Expected [t, h, w]. Skipping resize.")
-                         face_mask = torch.ones_like(latent) # Fallback
-                     else:
-                        # 获取目标 latent 形状
-                         num_latent_ch, num_latent_t_actual, target_h, target_w = latent.shape
-                         # 确保时间维度匹配 (裁剪或重复最后一帧)
-                         if face_mask.shape[0] < num_latent_t_actual:
-                             padding = torch.repeat_interleave(face_mask[-1:], num_latent_t_actual - face_mask.shape[0], dim=0)
-                             face_mask = torch.cat([face_mask, padding], dim=0)
-                         elif face_mask.shape[0] > num_latent_t_actual:
-                             face_mask = face_mask[:num_latent_t_actual]
-
-                         # 调整face_mask的尺寸以匹配latent的空间维度 [h, w]
-                         # interpolate 需要 [N, C, H, W] 或 [N, C, D, H, W]
-                         # 将 t 视为 N, 添加 C 维度
-                         face_mask = face_mask.unsqueeze(1) # -> [t, 1, h, w]
-                         face_mask = torch.nn.functional.interpolate(
-                             face_mask,
-                             size=(target_h, target_w),
-                             mode='bilinear',
-                             align_corners=False
-                         ) # -> [t, 1, target_h, target_w]
-
-                         face_mask = face_mask.squeeze(1) # -> [t, target_h, target_w]
-
-                         # 扩展维度以匹配 latent [ch, t, h, w]
-                         face_mask = face_mask.unsqueeze(0) # -> [1, t, target_h, target_w]
-                         face_mask = face_mask.repeat(num_latent_ch, 1, 1, 1) # -> [ch, t, target_h, target_w]
-
-
-                elif isinstance(mask_data, np.ndarray) or isinstance(mask_data, Image.Image): # 兼容旧的 png 文件 (如果用户手动移动了png到坐标目录)
-                     logger.warning(f"Loaded face_mask appears to be an old image format (png?) moved to coord dir: {face_mask_coord_path}. Applying image processing logic.")
-                     if isinstance(mask_data, Image.Image):
-                         face_mask_np = np.array(mask_data)
-                     else: # ndarray
-                         face_mask_np = mask_data
-
-                     face_mask = torch.from_numpy(face_mask_np)
-                     # --- 从旧的png处理逻辑复制并调整 ---
-                     # 获取目标 latent 形状
-                     num_latent_ch, num_latent_t_actual, target_h, target_w = latent.shape
-                     # 处理维度 HWC -> CHW or HW -> 1HW
-                     if face_mask.ndim == 3:
-                        face_mask = face_mask.permute(2, 0, 1)
-                     elif face_mask.ndim == 2:
-                        face_mask = face_mask.unsqueeze(0)
-                     # 确保是单通道mask
-                     if face_mask.shape[0] > 1:
-                         logger.warning(f"Image mask has multiple channels ({face_mask.shape[0]}), using only the first channel.")
-                         face_mask = face_mask[0:1, :, :]
-                     elif face_mask.shape[0] == 0:
-                         logger.error(f"Image mask has 0 channels. Fallback to ones.")
-                         face_mask = torch.ones_like(latent)
-                         # Skip further processing for this case
-                         return latent, prompt_embed, prompt_attention_mask, audio_embed, face_embed, face_mask, audio_embed_file
-
-
-                     # 转换为浮点数并归一化
-                     if face_mask.dtype != torch.float32: face_mask = face_mask.float()
-                     if face_mask.max() > 1.0: face_mask = face_mask / 255.0
-
-                     # --- 新增：Center Crop 到 8x latent size ---
-                     current_h, current_w = face_mask.shape[1], face_mask.shape[2]
-                     target_crop_h = target_h * 8
-                     target_crop_w = target_w * 8
-                     if current_h != target_crop_h or current_w != target_crop_w:
-                         if current_h >= target_crop_h and current_w >= target_crop_w:
-                             crop_y = (current_h - target_crop_h) // 2
-                             crop_x = (current_w - target_crop_w) // 2
-                             face_mask = face_mask[:, crop_y : crop_y + target_crop_h, crop_x : crop_x + target_crop_w]
-                             logger.debug(f"Cropped image mask from {current_h, current_w} to {target_crop_h, target_crop_w}")
-                         else:
-                             logger.warning(f"Image mask size ({current_h}, {current_w}) is smaller than target crop size ({target_crop_h}, {target_crop_w}). Skipping crop before interpolate.")
-                     # --- 结束 Center Crop ---
-
-
-                     # 调整尺寸 - Interpolate to latent size
-                     # interpolate 需要 [N, C, H, W]
-                     face_mask = torch.nn.functional.interpolate(
-                         face_mask.unsqueeze(0), # [1, 1, H', W']
-                         size=(target_h, target_w),
-                         mode='bilinear', align_corners=False
-                     ) # [1, 1, th, tw]
-                     face_mask = face_mask.squeeze(0) # [1, th, tw]
-
-                     # 重复时间维度
-                     face_mask = face_mask.unsqueeze(1).repeat(num_latent_ch, num_latent_t_actual, 1, 1) # [ch, t, th, tw]
-
-
+                if not reconstructed_masks:
+                        logger.error(f"未能重建任何 mask 帧 {face_mask_coord_path}. Using ones mask.")
+                        face_mask = torch.ones(num_latent_ch, num_latent_t_actual, target_h, target_w) # Fallback
                 else:
-                    logger.warning(f"Loaded face_mask file format unknown or invalid: {face_mask_coord_path}. Using ones mask.")
-                    face_mask = torch.ones_like(latent) # Fallback
+                    face_mask = torch.stack(reconstructed_masks, dim=0) # Shape: [num_frames_in_file, H_orig, W_orig]
+                    current_t, current_h, current_w = face_mask.shape[0], face_mask.shape[1], face_mask.shape[2]
+
+                    # --- New Aspect-Ratio Preserving Center Crop (inspired by load_and_process_face_mask) ---
+                    # target_h, target_w are latent H, W (e.g., 32x32 or 64x64)
+                    # Current_h, current_w are original H, W of face_mask (e.g., 1024x1024 or source video resolution)
+
+                    # Target dimensions for the aspect ratio of the crop region are 8x the latent dimensions
+                    ar_crop_target_h = target_h * 8
+                    ar_crop_target_w = target_w * 8
+                    
+                    face_mask_after_ar_crop = face_mask # Default to current face_mask if AR crop is not possible or not needed
+
+                    if ar_crop_target_h <= 0 or ar_crop_target_w <= 0:
+                        logger.warning(f"Target AR crop dimensions ({ar_crop_target_h}, {ar_crop_target_w}) are invalid for {sample_id}. Using un-AR-cropped mask ({current_h}x{current_w}).")
+                    elif current_h <= 0 or current_w <=0: 
+                        logger.warning(f"Original mask dimensions for AR cropping ({current_h}, {current_w}) are invalid for {sample_id}. Using un-AR-cropped mask.")
+                    else:
+                        # Calculate aspect ratios
+                        # target_ar_for_crop is the AR of the 8*latent_dim region we want to achieve
+                        target_ar_for_crop = float(ar_crop_target_h) / ar_crop_target_w
+                        # input_ar_current_mask is AR of current face_mask (e.g. 1024x1024 mask)
+                        input_ar_current_mask = float(current_h) / current_w
+
+                        calc_crop_h_pixels = 0
+                        calc_crop_w_pixels = 0
+
+                        if input_ar_current_mask > target_ar_for_crop:
+                            # Mask is 'taller' or less 'wide' than the target AR. Crop height.
+                            calc_crop_h_pixels = int(current_w * target_ar_for_crop) # New height based on current_w and target AR
+                            calc_crop_w_pixels = current_w                           # Width remains current_w
+                        else:
+                            # Mask is 'wider' or less 'tall' than the target AR (or same AR). Crop width.
+                            calc_crop_h_pixels = current_h                           # Height remains current_h
+                            calc_crop_w_pixels = int(current_h / target_ar_for_crop) # New width based on current_h and target AR
+                        
+                        if calc_crop_h_pixels > 0 and calc_crop_w_pixels > 0:
+                            crop_y_start_pixels = int(round((current_h - calc_crop_h_pixels) / 2.0))
+                            crop_x_start_pixels = int(round((current_w - calc_crop_w_pixels) / 2.0))
+                            
+                            crop_y_start_pixels = max(0, crop_y_start_pixels)
+                            crop_x_start_pixels = max(0, crop_x_start_pixels)
+
+                            # Final actual crop dimensions, ensuring they don't go out of bounds
+                            actual_crop_h_pixels = min(calc_crop_h_pixels, current_h - crop_y_start_pixels)
+                            actual_crop_w_pixels = min(calc_crop_w_pixels, current_w - crop_x_start_pixels)
+
+                            if actual_crop_h_pixels > 0 and actual_crop_w_pixels > 0:
+                                face_mask_after_ar_crop = face_mask[
+                                    :, # All frames
+                                    crop_y_start_pixels : crop_y_start_pixels + actual_crop_h_pixels,
+                                    crop_x_start_pixels : crop_x_start_pixels + actual_crop_w_pixels
+                                ]
+                                logger.debug(f"Aspect-ratio preserved cropped mask for {sample_id} from ({current_h},{current_w}) to ({actual_crop_h_pixels},{actual_crop_w_pixels}) targeting AR ~{target_ar_for_crop:.2f} (for 8*latent region).")
+                            else:
+                                logger.warning(f"Final actual AR crop dimensions ({actual_crop_h_pixels}, {actual_crop_w_pixels}) are invalid for {sample_id}. Using un-AR-cropped mask ({current_h}x{current_w}).")
+                        else:
+                            logger.warning(f"Initial calculated AR crop dimensions ({calc_crop_h_pixels}, {calc_crop_w_pixels}) are invalid for {sample_id}. Using un-AR-cropped mask ({current_h}x{current_w}).")
+                    
+                    face_mask = face_mask_after_ar_crop # Assign the (potentially) AR-cropped mask back
+                    # Update current_h and current_w to reflect the dimensions of `face_mask` *after* this AR crop,
+                    # as these will be the input dimensions for the subsequent interpolation step.
+                    current_h, current_w = face_mask.shape[1], face_mask.shape[2] 
+                    # --- End of New Aspect-Ratio Preserving Center Crop ---
+
+                    # --- 调整尺寸和维度以匹配 latent (包括时间维度插值) ---
+                    # 准备进行 3D 插值 (D, H, W) -> (T_latent, target_h, target_w)
+                    # interpolate 需要 [N, C, D, H, W]
+                    face_mask = face_mask.unsqueeze(0).unsqueeze(0) # [1, 1, T_file, H_crop, W_crop]
+
+                    # 插值到目标尺寸 [T_latent, target_h, target_w]
+                    face_mask = torch.nn.functional.interpolate(
+                        face_mask,
+                        size=(num_latent_t_actual, target_h, target_w), # Interpolate T, H, W
+                        mode='trilinear', # Use trilinear for 3D interpolation
+                        align_corners=False # Typically False for spatial dims, consider if True needed for time
+                    ) # [1, 1, T_latent, target_h, target_w]
+
+                    # 移除 N 和 C 维度
+                    face_mask = face_mask.squeeze(0).squeeze(0) # [T_latent, target_h, target_w]
+
+                    # 扩展/重复通道维度以匹配 latent [ch, t, target_h, target_w]
+                    face_mask = face_mask.unsqueeze(0).repeat(num_latent_ch, 1, 1, 1) # [ch, T_latent, target_h, target_w]
+
+                    # 保持原始 mask 值 (0.1, 0.5, 1.0) 以便后续可能的不同处理
+                    # face_mask = (face_mask >= FACE_MASK_VALUE).float()
+
+
+                # elif isinstance(mask_data, torch.Tensor): # 兼容旧的 Tensor 格式 (.pt 文件)
+                #      logger.warning(f"Loaded face_mask is an old Tensor format: {face_mask_coord_path}. Applying direct interpolation (no 8x crop).")
+                #      face_mask = mask_data
+                #      if face_mask.dtype != torch.float32:
+                #          face_mask = face_mask.float()
+
+                #      # 预期维度是 [t, h, w]
+                #      if face_mask.ndim != 3:
+                #          logger.warning(f"Loaded .pt face_mask has unexpected dimensions: {face_mask.shape}. Expected [t, h, w]. Skipping resize.")
+                #          face_mask = torch.ones_like(latent) # Fallback
+                #      else:
+                #         # 获取目标 latent 形状
+                #          num_latent_ch, num_latent_t_actual, target_h, target_w = latent.shape
+                #          # 确保时间维度匹配 (裁剪或重复最后一帧)
+                #          if face_mask.shape[0] < num_latent_t_actual:
+                #              padding = torch.repeat_interleave(face_mask[-1:], num_latent_t_actual - face_mask.shape[0], dim=0)
+                #              face_mask = torch.cat([face_mask, padding], dim=0)
+                #          elif face_mask.shape[0] > num_latent_t_actual:
+                #              face_mask = face_mask[:num_latent_t_actual]
+
+                #          # 调整face_mask的尺寸以匹配latent的空间维度 [h, w]
+                #          # interpolate 需要 [N, C, H, W] 或 [N, C, D, H, W]
+                #          # 将 t 视为 N, 添加 C 维度
+                #          face_mask = face_mask.unsqueeze(1) # -> [t, 1, h, w]
+                #          face_mask = torch.nn.functional.interpolate(
+                #              face_mask,
+                #              size=(target_h, target_w),
+                #              mode='bilinear',
+                #              align_corners=False
+                #          ) # -> [t, 1, target_h, target_w]
+
+                #          face_mask = face_mask.squeeze(1) # -> [t, target_h, target_w]
+
+                #          # 扩展维度以匹配 latent [ch, t, h, w]
+                #          face_mask = face_mask.unsqueeze(0) # -> [1, t, target_h, target_w]
+                #          face_mask = face_mask.repeat(num_latent_ch, 1, 1, 1) # -> [ch, t, target_h, target_w]
+
+
+                # elif isinstance(mask_data, np.ndarray) or isinstance(mask_data, Image.Image): # 兼容旧的 png 文件 (如果用户手动移动了png到坐标目录)
+                #      logger.warning(f"Loaded face_mask appears to be an old image format (png?) moved to coord dir: {face_mask_coord_path}. Applying image processing logic.")
+                #      if isinstance(mask_data, Image.Image):
+                #          face_mask_np = np.array(mask_data)
+                #      else: # ndarray
+                #          face_mask_np = mask_data
+
+                #      face_mask = torch.from_numpy(face_mask_np)
+                #      # --- 从旧的png处理逻辑复制并调整 ---
+                #      # 获取目标 latent 形状
+                #      num_latent_ch, num_latent_t_actual, target_h, target_w = latent.shape
+                #      # 处理维度 HWC -> CHW or HW -> 1HW
+                #      if face_mask.ndim == 3:
+                #         face_mask = face_mask.permute(2, 0, 1)
+                #      elif face_mask.ndim == 2:
+                #         face_mask = face_mask.unsqueeze(0)
+                #      # 确保是单通道mask
+                #      if face_mask.shape[0] > 1:
+                #          logger.warning(f"Image mask has multiple channels ({face_mask.shape[0]}), using only the first channel.")
+                #          face_mask = face_mask[0:1, :, :]
+                #      elif face_mask.shape[0] == 0:
+                #          logger.error(f"Image mask has 0 channels. Fallback to ones.")
+                #          face_mask = torch.ones_like(latent)
+                #          # Skip further processing for this case
+                #          return latent, caption, audio_embed, face_mask
+
+
+                #      # 转换为浮点数并归一化
+                #      if face_mask.dtype != torch.float32: face_mask = face_mask.float()
+                #      if face_mask.max() > 1.0: face_mask = face_mask / 255.0
+
+                #      # --- 新增：Center Crop 到 8x latent size ---
+                #      current_h, current_w = face_mask.shape[1], face_mask.shape[2]
+                #      target_crop_h = target_h * 8
+                #      target_crop_w = target_w * 8
+                #      if current_h != target_crop_h or current_w != target_crop_w:
+                #          if current_h >= target_crop_h and current_w >= target_crop_w:
+                #              crop_y = (current_h - target_crop_h) // 2
+                #              crop_x = (current_w - target_crop_w) // 2
+                #              face_mask = face_mask[:, crop_y : crop_y + target_crop_h, crop_x : crop_x + target_crop_w]
+                #              logger.debug(f"Cropped image mask from {current_h, current_w} to {target_crop_h, target_crop_w}")
+                #          else:
+                #              logger.warning(f"Image mask size ({current_h}, {current_w}) is smaller than target crop size ({target_crop_h}, {target_crop_w}). Skipping crop before interpolate.")
+                #      # --- 结束 Center Crop ---
+
+
+                #      # 调整尺寸 - Interpolate to latent size
+                #      # interpolate 需要 [N, C, H, W]
+                #      face_mask = torch.nn.functional.interpolate(
+                #          face_mask.unsqueeze(0), # [1, 1, H', W']
+                #          size=(target_h, target_w),
+                #          mode='bilinear', align_corners=False
+                #      ) # [1, 1, th, tw]
+                #      face_mask = face_mask.squeeze(0) # [1, th, tw]
+
+                #      # 重复时间维度
+                #      face_mask = face_mask.unsqueeze(1).repeat(num_latent_ch, num_latent_t_actual, 1, 1) # [ch, t, th, tw]
+
+
+                # else:
+                #     logger.error(f"Loaded face_mask file format unknown or invalid: {face_mask_coord_path}. Using ones mask.")
+                #     face_mask = torch.ones_like(latent) # Fallback
 
             except Exception as e:
                 logger.error(f"Error loading or processing face mask {face_mask_coord_path}: {e}", exc_info=True)
                 face_mask = torch.ones_like(latent) # Fallback on error
 
         else:
-            # logger.warning(f"Face mask coordinate file not found or not specified, using ones mask for latent {latent_file}")
+            logger.error(f"Face mask coordinate file not found or not specified, using ones mask for latent {latent_file}")
             # 如果文件不存在或未在json中指定，使用全1掩码
             face_mask = torch.ones_like(latent)
 
 
-        return latent, prompt_embed, prompt_attention_mask, audio_embed, face_embed, face_mask, audio_embed_file, cond_latents
+        # print(f"face_mask shape: {face_mask.shape}")
+        # print(f"face_mask dtype: {face_mask.dtype}")
+        # # print(f"face_mask unique values: {torch.unique(face_mask)}")
+        # print(f"caption: {caption}")
+        # print(f"audio_embed shape: {audio_embed.shape}")
+        # print(f"latent shape: {latent.shape}")
+
+        return latent, caption, audio_embed, face_mask, sample_id
 
     def __len__(self):
         return len(self.data_anno)
 
 
 def latent_collate_function_audio_i2v(batch):
-    latents, prompt_embeds, prompt_attention_masks, audio_embeds, face_embeds, face_masks, audio_embed_files, cond_latents = zip(*batch)
+    latents, captions, audio_embeds, face_masks, sample_ids = zip(*batch)
 
     # --- 处理 Latents ---
     # 计算 batch 中 latent 的最大尺寸
@@ -540,14 +536,14 @@ def latent_collate_function_audio_i2v(batch):
         _, t_orig, h_orig, w_orig = shape
         latent_attn_mask[i, :t_orig, :h_orig, :w_orig] = 1 # 有效区域设为 1
 
-    # --- 处理 Prompts ---
-    prompt_embeds = torch.stack(prompt_embeds, dim=0)
-    prompt_attention_masks = torch.stack(prompt_attention_masks, dim=0)
+    # # --- 处理 Prompts ---
+    # prompt_embeds = torch.stack(prompt_embeds, dim=0)
+    # prompt_attention_masks = torch.stack(prompt_attention_masks, dim=0)
 
     # --- 处理 Cond Latents ---
-    print(f"cond_latents shape before stack: {len(cond_latents)}, dtype: {cond_latents[0].dtype}")
-    cond_latents = torch.stack(cond_latents, dim=0)
-    print(f"cond_latents shape after stack: {cond_latents.shape}, dtype: {cond_latents.dtype}")
+    # print(f"cond_latents shape before stack: {len(cond_latents)}, dtype: {cond_latents[0].dtype}")
+    # cond_latents = torch.stack(cond_latents, dim=0)
+    # print(f"cond_latents shape after stack: {cond_latents.shape}, dtype: {cond_latents.dtype}")
 
     # --- 处理 Face Masks ---
     # 在 __getitem__ 中 mask 已经与对应 latent 的（未padding）尺寸对齐
@@ -577,7 +573,7 @@ def latent_collate_function_audio_i2v(batch):
 
 
     # --- 处理 Audio and Face Embeddings ---
-    if audio_embeds[0] is not None:
+    if audio_embeds is not None and audio_embeds[0] is not None:
         # 确保是 tensor 类型
         audio_embeds = [torch.as_tensor(emb) if not isinstance(emb, torch.Tensor) else emb for emb in audio_embeds]
         # 可能需要 padding audio embeds if lengths differ? Assuming fixed length or handled elsewhere for now.
@@ -592,30 +588,30 @@ def latent_collate_function_audio_i2v(batch):
     else:
         audio_embeds = None
 
-    if face_embeds[0] is not None:
-        # 确保是 tensor 类型
-        face_embeds = [torch.as_tensor(emb) if not isinstance(emb, torch.Tensor) else emb for emb in face_embeds]
-        try:
-            face_embeds = torch.stack(face_embeds, dim=0)
-        except RuntimeError as e:
-             logger.error(f"Error stacking face embeddings: {e}. Check if face embed dimensions are consistent across the batch.")
-             face_embeds = None
-             logger.warning("Setting face_embeds to None due to stacking error.")
+    # if face_embeds[0] is not None:
+    #     # 确保是 tensor 类型
+    #     face_embeds = [torch.as_tensor(emb) if not isinstance(emb, torch.Tensor) else emb for emb in face_embeds]
+    #     try:
+    #         face_embeds = torch.stack(face_embeds, dim=0)
+    #     except RuntimeError as e:
+    #          logger.error(f"Error stacking face embeddings: {e}. Check if face embed dimensions are consistent across the batch.")
+    #          face_embeds = None
+    #          logger.warning("Setting face_embeds to None due to stacking error.")
 
-    else:
-        face_embeds = None
+    # else:
+    #     face_embeds = None
 
     # 返回结果
-    return latents_stacked, prompt_embeds, latent_attn_mask, prompt_attention_masks, audio_embeds, face_embeds, face_masks_stacked, audio_embed_files, cond_latents
+    return latents_stacked, captions, audio_embeds, face_masks_stacked, sample_ids
 
 
 if __name__ == "__main__":
     # 注意：确保此处的 json 文件引用的 face_emb_path 对应的文件是新的坐标格式 (.pt 字典)
     # 或者旧的 .pt tensor / .png 格式以测试兼容性
-    import torch.multiprocessing as mp
+    # import torch.multiprocessing as mp
 
 
-    os.environ['MODEL_BASE'] = "/data/nas/yexin/workspace/shunian/model"
+    # os.environ['MODEL_BASE'] = "/data/nas/yexin/workspace/shunian/model"
     class Args:
         # 从 finetune_hunyuan_audio_i2v.sh 和 train_audio_i2v.py 推断的参数
         vae_precision = "bf16"
@@ -638,56 +634,53 @@ if __name__ == "__main__":
 
     args = Args() # 实例化 Args
 
-    if args.i2v_mode:
-        image_embed_interleave = 4
-    else:
-        image_embed_interleave = 1
+    # if args.i2v_mode:
+    #     image_embed_interleave = 4
+    # else:
+    #     image_embed_interleave = 1
 
 
-    from fastvideo.utils.load import load_vae
-    # 使用 finetune 脚本中的 VAE 路径和 args 中的 model_type
-    vae, _, _ = load_vae(model_type=args.model_type, pretrained_model_name_or_path="/data/nas/yexin/workspace/shunian/model/")
-    vae = vae.to("cuda")
+    # from fastvideo.utils.load import load_vae
+    # # 使用 finetune 脚本中的 VAE 路径和 args 中的 model_type
+    # vae, _, _ = load_vae(model_type=args.model_type, pretrained_model_name_or_path="/data/nas/yexin/workspace/shunian/model/")
+    # vae = vae.to("cuda")
 
-    from fastvideo.models.hunyuan.text_encoder import TextEncoder_i2v
-    text_encoder = TextEncoder_i2v(
-            text_encoder_type=args.text_encoder,
-            max_length=args.text_len
-            + (
-                PROMPT_TEMPLATE[args.prompt_template_video].get("crop_start", 0)
-                if args.prompt_template_video is not None
-                else PROMPT_TEMPLATE[args.prompt_template].get("crop_start", 0)
-                if args.prompt_template is not None
-                else 0
-            ),
-            text_encoder_precision=args.text_encoder_precision,
-            tokenizer_type=args.tokenizer,
-            i2v_mode=args.i2v_mode,
-            prompt_template=(
-                PROMPT_TEMPLATE[args.prompt_template]
-                if args.prompt_template is not None
-                else None
-            ),
-            prompt_template_video=(
-                PROMPT_TEMPLATE[args.prompt_template_video]
-                if args.prompt_template_video is not None
-                else None
-            ),
-            hidden_state_skip_layer=args.hidden_state_skip_layer,
-            apply_final_norm=args.apply_final_norm,
-            reproduce=args.reproduce,
-            logger=logger,
-            device="cuda",
-            image_embed_interleave=image_embed_interleave
-        )
+    # from fastvideo.models.hunyuan.text_encoder import TextEncoder_i2v
+    # text_encoder = TextEncoder_i2v(
+    #         text_encoder_type=args.text_encoder,
+    #         max_length=args.text_len
+    #         + (
+    #             PROMPT_TEMPLATE[args.prompt_template_video].get("crop_start", 0)
+    #             if args.prompt_template_video is not None
+    #             else PROMPT_TEMPLATE[args.prompt_template].get("crop_start", 0)
+    #             if args.prompt_template is not None
+    #             else 0
+    #         ),
+    #         text_encoder_precision=args.text_encoder_precision,
+    #         tokenizer_type=args.tokenizer,
+    #         i2v_mode=args.i2v_mode,
+    #         prompt_template=(
+    #             PROMPT_TEMPLATE[args.prompt_template]
+    #             if args.prompt_template is not None
+    #             else None
+    #         ),
+    #         prompt_template_video=(
+    #             PROMPT_TEMPLATE[args.prompt_template_video]
+    #             if args.prompt_template_video is not None
+    #             else None
+    #         ),
+    #         hidden_state_skip_layer=args.hidden_state_skip_layer,
+    #         apply_final_norm=args.apply_final_norm,
+    #         reproduce=args.reproduce,
+    #         logger=logger,
+    #         device="cuda",
+    #         image_embed_interleave=image_embed_interleave
+    #     )
 
     dataset = LatentDatasetAudio_i2v(
         "/data/nas/yexin/workspace/shunian/model_training/FastVideo/data/252_hour_test_480p_49frames/videos2caption.json", # 使用 finetune 脚本中的数据路径
         num_latent_t=args.num_latent_t, # 使用 args 中的值
         cfg_rate=args.cfg, # 使用 args 中的值
-        vae=vae,
-        text_encoder=text_encoder,
-        args=args, # 传递 args 对象
         )
     # 更新 collate_fn
     dataloader = torch.utils.data.DataLoader(
@@ -701,18 +694,13 @@ if __name__ == "__main__":
     # 更新迭代变量
     for batch_data in dataloader:
         # 解包 batch 数据
-        latents, prompt_embeds, latent_attn_mask, prompt_attention_masks, audio_embeds, face_embeds, face_masks, audio_files, cond_latents = batch_data
+        latents, captions, audio_embeds, face_masks, sample_ids = batch_data
 
         print("--- Batch Data ---")
         print(f"Latents shape: {latents.shape}, dtype: {latents.dtype}")
-        print(f"Prompt Embeds shape: {prompt_embeds.shape}, dtype: {prompt_embeds.dtype}")
-        print(f"Latent Attn Mask shape: {latent_attn_mask.shape}, dtype: {latent_attn_mask.dtype}, Unique values: {torch.unique(latent_attn_mask)}")
-        print(f"Prompt Attn Mask shape: {prompt_attention_masks.shape}, dtype: {prompt_attention_masks.dtype}")
+        print(f"Captions : {captions}")
         print(f"Audio Embeds shape: {audio_embeds.shape if audio_embeds is not None else None}")
-        print(f"Face Embeds shape: {face_embeds.shape if face_embeds is not None else None}")
         print(f"Face Masks shape: {face_masks.shape}, dtype: {face_masks.dtype}, Unique values: {torch.unique(face_masks)}")
-        print(f"Cond Latents shape: {cond_latents.shape}, dtype: {cond_latents.dtype}")
-        # print(f"Audio Files: {audio_files}") # 可能太长，注释掉
 
         # 可以添加断点进行更详细的检查
         # import pdb; pdb.set_trace()

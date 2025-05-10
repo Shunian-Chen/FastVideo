@@ -32,7 +32,7 @@ from fastvideo.models.mochi_hf.pipeline_mochi import MochiPipeline
 from fastvideo.models.hunyuan_hf.pipeline_hunyuan import HunyuanVideoPipeline
 
 from fastvideo.utils.checkpoint import (resume_lora_optimizer, save_checkpoint,
-                                        save_lora_checkpoint)
+                                        save_lora_checkpoint, resume_checkpoint)
 from fastvideo.utils.communications import (broadcast,
                                             sp_parallel_dataloader_wrapper,
                                             sp_parallel_dataloader_wrapper_audio)
@@ -56,189 +56,6 @@ logger.add(sys.stdout, level="WARNING")
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.31.0")
-
-
-class AnomalyDetector:
-    def __init__(self, 
-                 output_dir,
-                 rank,
-                 window_size=50, 
-                 loss_threshold_factor=3.0, 
-                 grad_norm_threshold_factor=3.0,
-                 fixed_loss_threshold=None,
-                 fixed_grad_norm_threshold=None):
-        """
-        初始化异常检测器
-        
-        参数:
-            output_dir: 输出目录
-            rank: 进程ID
-            window_size: 滑动窗口大小
-            loss_threshold_factor: 损失阈值因子 (均值 + factor * 标准差)
-            grad_norm_threshold_factor: 梯度范数阈值因子
-            fixed_loss_threshold: 固定损失阈值，若设置则覆盖动态阈值
-            fixed_grad_norm_threshold: 固定梯度范数阈值，若设置则覆盖动态阈值
-        """
-        self.output_dir = output_dir
-        self.rank = rank
-        self.window_size = window_size
-        self.loss_threshold_factor = loss_threshold_factor
-        self.grad_norm_threshold_factor = grad_norm_threshold_factor
-        self.fixed_loss_threshold = fixed_loss_threshold
-        self.fixed_grad_norm_threshold = fixed_grad_norm_threshold
-        
-        # 创建输出目录
-        self.anomaly_dir = os.path.join(output_dir, "anomalies")
-        self.anomaly_data_dir = os.path.join(self.anomaly_dir, "data")
-        os.makedirs(self.anomaly_dir, exist_ok=True)
-        os.makedirs(self.anomaly_data_dir, exist_ok=True)
-        
-        # 初始化滑动窗口
-        self.loss_window = deque(maxlen=window_size)
-        self.grad_norm_window = deque(maxlen=window_size)
-        
-        # 初始化JSONL文件
-        self.jsonl_path = os.path.join(self.anomaly_dir, f"anomalies_rank_{rank}.jsonl")
-        
-    def update(self, loss, grad_norm):
-        """更新滑动窗口"""
-        self.loss_window.append(loss)
-        self.grad_norm_window.append(grad_norm)
-        
-    def is_anomaly(self, loss, grad_norm):
-        """检测当前值是否为异常"""
-        # 如果窗口未满一半，不检测异常
-        if len(self.loss_window) < self.window_size // 4:  # 从window_size // 2改为window_size // 4，更早开始检测
-            return False, {}
-        
-        # 计算动态阈值（使用中位数而不是均值，更加鲁棒）
-        loss_list = list(self.loss_window)
-        grad_norm_list = list(self.grad_norm_window)
-        
-        # 计算中位数 - 比均值更鲁棒，不受极端值影响
-        loss_median = float(np.median(loss_list))
-        grad_norm_median = float(np.median(grad_norm_list))
-        
-        # 计算MAD（中位数绝对偏差）- 比标准差更鲁棒
-        loss_mad = float(np.median(np.abs(np.array(loss_list) - loss_median)))
-        grad_norm_mad = float(np.median(np.abs(np.array(grad_norm_list) - grad_norm_median)))
-        
-        # 当MAD为0时（例如多个相同的值），使用标准差的备选方案
-        if loss_mad == 0:
-            loss_mad = float(np.std(loss_list))
-        if grad_norm_mad == 0:
-            grad_norm_mad = float(np.std(grad_norm_list))
-        
-        # 动态阈值（基于中位数和MAD）
-        # 通常MAD的系数要比标准差的系数大，因为MAD通常小于标准差
-        # MAD系数 = 标准差系数 * 1.4826（正态分布下MAD与标准差的关系）
-        mad_factor = self.loss_threshold_factor * 1.4826
-        
-        loss_threshold = self.fixed_loss_threshold if self.fixed_loss_threshold is not None else \
-                        (loss_median + mad_factor * loss_mad)
-        grad_norm_threshold = self.fixed_grad_norm_threshold if self.fixed_grad_norm_threshold is not None else \
-                             (grad_norm_median + mad_factor * grad_norm_mad)
-        
-        # 为了参考，仍然计算均值和标准差
-        loss_mean = float(np.mean(loss_list))
-        loss_std = float(np.std(loss_list))
-        grad_norm_mean = float(np.mean(grad_norm_list))
-        grad_norm_std = float(np.std(grad_norm_list))
-        
-        # 检测异常：除了标准偏差外，还检测相对于均值的突变
-        is_loss_anomaly = loss > loss_threshold
-        is_grad_anomaly = grad_norm > grad_norm_threshold
-        
-        # 增加相对变化率检测：如果当前值比前一个时间步的值突然增加过多
-        relative_loss_change = 0
-        relative_grad_change = 0
-        if len(self.loss_window) > 1:
-            prev_loss = self.loss_window[-1]
-            if prev_loss > 0:
-                relative_loss_change = (loss - prev_loss) / prev_loss
-            
-            prev_grad = self.grad_norm_window[-1]
-            if prev_grad > 0:
-                relative_grad_change = (grad_norm - prev_grad) / prev_grad
-        
-        # 如果相对变化率超过50%，也认为是异常
-        is_loss_spike = relative_loss_change > 0.5
-        is_grad_spike = relative_grad_change > 0.5
-        
-        threshold_info = {
-            "loss_median": loss_median,
-            "loss_mad": loss_mad,
-            "loss_threshold": float(loss_threshold),
-            "grad_norm_median": grad_norm_median,
-            "grad_norm_mad": grad_norm_mad,
-            "grad_norm_threshold": float(grad_norm_threshold),
-            "loss_mean": loss_mean,  # 保留均值和标准差以便参考
-            "loss_std": loss_std,
-            "grad_norm_mean": grad_norm_mean,
-            "grad_norm_std": grad_norm_std,
-            "relative_loss_change": float(relative_loss_change),
-            "relative_grad_change": float(relative_grad_change)
-        }
-        
-        # 任一条件满足即为异常
-        return (is_loss_anomaly or is_grad_anomaly or is_loss_spike or is_grad_spike), threshold_info
-    
-    def save_batch_data(self, step, batch_data):
-        """保存批次数据"""
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        data_dir = os.path.join(self.anomaly_data_dir, f"step_{step}_rank_{self.rank}_{timestamp}")
-        os.makedirs(data_dir, exist_ok=True)
-        
-        batch_info = {}
-        
-        # 保存各种张量数据
-        for key, value in batch_data.items():
-            if isinstance(value, torch.Tensor):
-                file_path = os.path.join(data_dir, f"{key}.pt")
-                torch.save(value, file_path)
-                batch_info[f"{key}_shape"] = list(value.shape)
-                batch_info[f"{key}_path"] = os.path.relpath(file_path, self.output_dir)
-            elif isinstance(value, list) and value and isinstance(value[0], str):
-                # 假设是文件路径列表
-                batch_info[f"{key}"] = value
-            else:
-                # 其他类型的数据直接添加到info中
-                try:
-                    json.dumps({key: value})  # 测试是否可JSON序列化
-                    batch_info[key] = value
-                except:
-                    batch_info[key] = str(value)
-        
-        return data_dir, batch_info
-    
-    def log_anomaly(self, step, loss, grad_norm, batch_data, checkpoint_path=None):
-        """记录异常"""
-        # 检查是否为异常
-        is_anomaly, threshold_info = self.is_anomaly(loss, grad_norm)
-        if not is_anomaly:
-            return False
-        
-        # 保存批次数据
-        data_dir, batch_info = self.save_batch_data(step, batch_data)
-        
-        # 记录异常信息
-        anomaly_info = {
-            "step": step,
-            "rank": self.rank,
-            "timestamp": datetime.datetime.now().isoformat(),
-            "loss": float(loss),
-            "grad_norm": float(grad_norm),
-            "batch_info": batch_info,
-            "model_checkpoint": checkpoint_path,
-            "threshold_info": threshold_info,
-            "data_dir": os.path.relpath(data_dir, self.output_dir)
-        }
-        
-        # 写入JSONL文件
-        with open(self.jsonl_path, "a") as f:
-            f.write(json.dumps(anomaly_info) + "\n")
-        
-        return True
 
 
 def compute_density_for_timestep_sampling(
@@ -412,6 +229,30 @@ def main(args):
     device = torch.cuda.current_device()
     initialize_sequence_parallel_state(args.sp_size)
 
+    # 在初始化sequence_parallel_state之后添加检查逻辑
+    checkpoint_exists = False
+    if rank == 0 and args.output_dir is not None:
+        # 检查输出目录是否存在checkpoint-*文件夹
+        checkpoints = [
+            d for d in os.listdir(args.output_dir)
+            if os.path.isdir(os.path.join(args.output_dir, d)) 
+            and d.startswith("checkpoint-")
+        ]
+        checkpoint_exists = len(checkpoints) > 0
+
+    # 广播检查结果到所有rank
+    checkpoint_exists_list = [checkpoint_exists]
+    dist.broadcast_object_list(checkpoint_exists_list, src=0)
+    checkpoint_exists = checkpoint_exists_list[0]
+
+    # 自动设置resume_from_checkpoint参数
+    if checkpoint_exists and args.resume_from_checkpoint is None:
+        args.resume_from_checkpoint = "auto"
+        main_print("检测到已有检查点，将自动恢复最新检查点")
+    elif not checkpoint_exists and args.resume_from_checkpoint is not None:
+        main_print("警告：指定了恢复检查点但目录中不存在检查点，将从头开始训练")
+        args.resume_from_checkpoint = None
+
     # If passed along, set the training seed now. On GPU...
     if args.seed is not None:
         # TODO: t within the same seq parallel group should be the same. Noise should be different.
@@ -423,22 +264,7 @@ def main(args):
     if rank <= 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    # 初始化异常检测器
-    anomaly_detector = AnomalyDetector(
-        output_dir=args.output_dir,
-        rank=rank,
-        window_size=50,
-        loss_threshold_factor=2.0,     # 从3.0降低到2.0，使其更容易捕获波动
-        grad_norm_threshold_factor=2.0, # 从3.0降低到2.0，使其更容易捕获波动
-        fixed_loss_threshold=0.3,      # 从0.5降低到0.3，降低固定阈值
-        fixed_grad_norm_threshold=1.0   # 从1.5降低到1.0，降低固定阈值
-    )
-
-    # For mixed precision training we cast all non-trainable weights to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
-
     # Create model:
-
     main_print(f"--> loading model from {args.pretrained_model_name_or_path}")
     # keep the master weight to float32
     transformer = load_transformer(
@@ -448,31 +274,51 @@ def main(args):
         torch.float32 if args.master_weight_type == "fp32" else torch.bfloat16,
     )
 
-    
+    all_params = list(transformer.parameters()) # 获取 FSDP 模型的所有参数
     if args.train_audio_only:
-        total_train_params = 0
-        params_to_optimize = []
         main_print("--> 只训练与音频相关的参数")
         audio_param_patterns = [
-            "audio_scale",
-            "audio_norm",
-            "audio_attn_qkv",
-            "audio_attn_q_norm",
-            "audio_attn_k_norm",
-            "audio_proj"
+            "audio_scale", "audio_norm", "audio_attn_qkv", "audio_attn_q_norm",
+            "audio_attn_k_norm", "audio_proj"
         ]
+        audio_params_to_optimize = []
+        frozen_params = []
+        audio_param_ids = set() # 用于快速查找
 
-        for name, param in transformer.named_parameters():
+        # 先找出所有音频参数
+        for name, param in transformer.named_parameters(): # 遍历 FSDP 模型参数
+            is_audio_param = False
             for pattern in audio_param_patterns:
                 if pattern in name:
-                    total_train_params += param.numel()
-                    params_to_optimize.append(param)
+                    is_audio_param = True
+                    break
+            if is_audio_param and param.requires_grad: # 确保参数本身是可训练的
+                audio_params_to_optimize.append(param)
+                audio_param_ids.add(id(param))
+                # main_print(f"  Optimizing: {name}") # 打印确认
+
+        # 将剩余参数视为冻结
+        for param in all_params:
+            if id(param) not in audio_param_ids:
+                frozen_params.append(param)
+                # 最好也确保这些参数不需要梯度
+                # param.requires_grad_(False) # 可以在 FSDP 包装前做，或者在这里确认
+
+        total_train_params = sum(p.numel() for p in audio_params_to_optimize)
         main_print(f"  音频相关训练参数数量 = {total_train_params / 1e6} M")
+
+        # 使用参数组初始化优化器
+        param_groups = [
+            {'params': audio_params_to_optimize, 'lr': args.learning_rate},
+            {'params': frozen_params, 'lr': 0.0} # 冻结参数的学习率设为 0
+        ]
+        main_print(f"  Optimizing {len(audio_params_to_optimize)} audio params.")
+        main_print(f"  Freezing {len(frozen_params)} other params.")
     else:
-        params_to_optimize = transformer.parameters()
-        params_to_optimize = list(
-            filter(lambda p: p.requires_grad, params_to_optimize))
-        total_train_params = sum(p.numel() for p in transformer.parameters() if p.requires_grad) / 1e6
+        params_to_optimize = [p for p in all_params if p.requires_grad]
+        total_train_params = sum(p.numel() for p in params_to_optimize)
+        main_print(f"  Total training parameters = {total_train_params / 1e6} M")
+        param_groups = [{'params': params_to_optimize, 'lr': args.learning_rate}]
 
     if args.use_lora:
         assert args.model_type != "hunyuan", "LoRA is only supported for huggingface model. Please use hunyuan_hf for lora finetuning"
@@ -509,6 +355,14 @@ def main(args):
                 main_print(
                     f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
                     f" {unexpected_keys}. ")
+
+    optimizer = torch.optim.AdamW(
+        param_groups, # 使用参数组
+        # lr 在组里定义了，这里可以不写，或者写一个默认值（会被组覆盖）
+        betas=(0.9, 0.999),
+        weight_decay=args.weight_decay,
+        eps=1e-8,
+    )
 
     main_print(
         f"  Total training parameters = {total_train_params} M"
@@ -552,19 +406,27 @@ def main(args):
 
     noise_scheduler = FlowMatchEulerDiscreteScheduler()
 
-
-    optimizer = torch.optim.AdamW(
-        params_to_optimize,
-        lr=args.learning_rate,
-        betas=(0.9, 0.999),
-        weight_decay=args.weight_decay,
-        eps=1e-8,
-    )
-
     init_steps = 0
-    if args.resume_from_lora_checkpoint:
-        transformer, optimizer, init_steps = resume_lora_optimizer(
-            transformer, args.resume_from_lora_checkpoint, optimizer)
+    if args.resume_from_checkpoint:
+        # 修改原有的恢复检查点逻辑
+        if args.use_lora:
+            transformer, optimizer, init_steps = resume_lora_optimizer(
+                transformer, args.output_dir, optimizer)
+        else:
+            # 自动查找最新检查点
+            if args.resume_from_checkpoint == "auto":
+                checkpoints = [d for d in os.listdir(args.output_dir) 
+                              if d.startswith("checkpoint-")]
+                checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
+                args.resume_from_checkpoint = os.path.join(
+                    args.output_dir, checkpoints[-1])
+                
+            transformer, optimizer, init_steps = resume_checkpoint(
+                transformer, optimizer, args.resume_from_checkpoint)
+        main_print(f"--> 成功从检查点恢复，初始step: {init_steps}")
+    else:
+        main_print("--> 未找到检查点，开始从头训练")
+
     main_print(f"optimizer: {optimizer}")
 
     lr_scheduler = get_scheduler(
@@ -704,9 +566,6 @@ def main(args):
         })
         progress_bar.update(1)
         
-        # 更新异常检测器并检查是否有异常
-        anomaly_detector.update(loss, grad_norm)
-        
         # 获取最新的检查点路径
         latest_checkpoint = None
         if step > args.checkpointing_steps:
@@ -714,17 +573,6 @@ def main(args):
             latest_checkpoint = os.path.join(args.output_dir, f"checkpoint-{checkpoint_step}")
             if not os.path.exists(latest_checkpoint):
                 latest_checkpoint = None
-        
-        # # 记录异常
-        # is_anomaly = anomaly_detector.log_anomaly(
-        #     step=step,
-        #     loss=loss,
-        #     grad_norm=grad_norm,
-        #     checkpoint_path=latest_checkpoint
-        # )
-        
-        # if is_anomaly:
-        #     main_print(f"Rank {rank}, Step {step}: Detected anomaly, loss={loss:.4f}, grad_norm={grad_norm:.4f}")
         
         if rank <= 0:
             wandb.log(
@@ -739,12 +587,12 @@ def main(args):
             )
         if step % args.checkpointing_steps == 0:
             if args.use_lora:
-                # Save LoRA weights
                 save_lora_checkpoint(transformer, optimizer, rank,
                                      args.output_dir, step, pipe)
             else:
-                # Your existing checkpoint saving code
-                save_checkpoint(transformer, rank, args.output_dir, step)
+                save_checkpoint(transformer, optimizer, rank,
+                               args.output_dir, step,
+                               train_audio_only=args.train_audio_only)
             dist.barrier()
         if args.log_validation and step % args.validation_steps == 0:
             log_validation(args,
@@ -758,8 +606,9 @@ def main(args):
         save_lora_checkpoint(transformer, optimizer, rank, args.output_dir,
                              args.max_train_steps, pipe)
     else:
-        save_checkpoint(transformer, rank, args.output_dir,
-                        args.max_train_steps)
+        save_checkpoint(transformer, optimizer, rank, args.output_dir,
+                        args.max_train_steps,
+                        train_audio_only=args.train_audio_only)
 
     if get_sequence_parallel_state():
         destroy_sequence_parallel_group()

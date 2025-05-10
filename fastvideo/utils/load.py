@@ -12,7 +12,9 @@ from fastvideo.models.hunyuan.modules.models import (
 
 from fastvideo.models.hunyuan.modules.model_audio import (
     HYVideoDiffusionTransformerAudio, MMDoubleStreamBlockAudio, MMSingleStreamBlockAudio)
-from fastvideo.models.hunyuan.text_encoder import TextEncoder
+from fastvideo.models.hunyuan.modules.model_audio_i2v import (
+    HYVideoDiffusionTransformerAudioI2V, MMDoubleStreamBlockAudioI2V, MMSingleStreamBlockAudioI2V)
+from fastvideo.models.hunyuan.text_encoder import TextEncoder, TextEncoder_i2v
 from fastvideo.models.hunyuan.vae.autoencoder_kl_causal_3d import \
     AutoencoderKLCausal3D
 from fastvideo.models.hunyuan_hf.modeling_hunyuan import (
@@ -21,6 +23,12 @@ from fastvideo.models.hunyuan_hf.modeling_hunyuan import (
 from fastvideo.models.mochi_hf.modeling_mochi import (MochiTransformer3DModel,
                                                       MochiTransformerBlock)
 from fastvideo.utils.logging_ import main_print
+from fastvideo.models.hunyuan.constants import (
+    PROMPT_TEMPLATE_ENCODE, PROMPT_TEMPLATE_ENCODE_VIDEO,
+    PROMPT_TEMPLATE_ENCODE_I2V, PROMPT_TEMPLATE_ENCODE_VIDEO_I2V,
+    NEGATIVE_PROMPT, NEGATIVE_PROMPT_I2V,
+    PROMPT_TEMPLATE
+)
 
 hunyuan_config = {
     "mm_double_blocks_depth": 20,
@@ -32,31 +40,145 @@ hunyuan_config = {
     "guidance_embed": True,
 }
 
-PROMPT_TEMPLATE_ENCODE = (
-    "<|start_header_id|>system<|end_header_id|>\n\nDescribe the image by detailing the color, shape, size, texture, "
-    "quantity, text, spatial relationships of the objects and background:<|eot_id|>"
-    "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>")
-PROMPT_TEMPLATE_ENCODE_VIDEO = (
-    "<|start_header_id|>system<|end_header_id|>\n\nDescribe the video by detailing the following aspects: "
-    "1. The main content and theme of the video."
-    "2. The color, shape, size, texture, quantity, text, and spatial relationships of the objects."
-    "3. Actions, events, behaviors temporal relationships, physical movement changes of the objects."
-    "4. background environment, light, style and atmosphere."
-    "5. camera angles, movements, and transitions used in the video:<|eot_id|>"
-    "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>")
 
-NEGATIVE_PROMPT = "Aerial view, aerial view, overexposed, low quality, deformation, a poor composition, bad hands, bad teeth, bad eyes, bad limbs, distortion"
 
-PROMPT_TEMPLATE = {
-    "dit-llm-encode": {
-        "template": PROMPT_TEMPLATE_ENCODE,
-        "crop_start": 36,
-    },
-    "dit-llm-encode-video": {
-        "template": PROMPT_TEMPLATE_ENCODE_VIDEO,
-        "crop_start": 95,
-    },
-}
+class HunyuanI2VTextEncoderWrapper(nn.Module):
+
+    def __init__(self, pretrained_model_name_or_path, device, args):
+        super().__init__()
+
+        text_len = 256
+        crop_start = PROMPT_TEMPLATE["dit-llm-encode-video-i2v"].get(
+            "crop_start", 0)
+
+        max_length = text_len + crop_start
+
+        # prompt_template
+        prompt_template = PROMPT_TEMPLATE["dit-llm-encode-i2v"]
+
+        # prompt_template_video
+        prompt_template_video = PROMPT_TEMPLATE["dit-llm-encode-video-i2v"]
+        
+        if args.i2v_mode:
+            image_embed_interleave = 4
+        else:
+            image_embed_interleave = 1
+
+        self.text_encoder = TextEncoder_i2v(
+            text_encoder_type=args.text_encoder,
+            max_length=args.text_len
+            + (
+                PROMPT_TEMPLATE[args.prompt_template_video].get("crop_start", 0)
+                if args.prompt_template_video is not None
+                else PROMPT_TEMPLATE[args.prompt_template].get("crop_start", 0)
+                if args.prompt_template is not None
+                else 0
+            ),
+            text_encoder_precision=args.text_encoder_precision,
+            tokenizer_type=args.tokenizer,
+            i2v_mode=args.i2v_mode,
+            prompt_template=(
+                PROMPT_TEMPLATE[args.prompt_template]
+                if args.prompt_template is not None
+                else None
+            ),
+            prompt_template_video=(
+                PROMPT_TEMPLATE[args.prompt_template_video]
+                if args.prompt_template_video is not None
+                else None
+            ),
+            hidden_state_skip_layer=args.hidden_state_skip_layer,
+            apply_final_norm=args.apply_final_norm,
+            reproduce=args.reproduce,
+            logger=None,
+            device=device,
+            image_embed_interleave=image_embed_interleave
+        )
+
+        text_encoder_path_2 = os.path.join(os.environ["MODEL_BASE"],
+                                           "text_encoder_2")
+        
+        self.text_encoder_2 = TextEncoder_i2v(
+            text_encoder_type=args.text_encoder_2,
+            text_encoder_path=text_encoder_path_2,
+            max_length=args.text_len_2,
+            tokenizer_type=args.tokenizer_2,
+            reproduce=args.reproduce,
+            logger=None,
+            device=device,
+        )
+
+    def encode_i2v(self, prompt, text_encoder, clip_skip=None, semantic_images=None):
+        # TODO
+        device = self.text_encoder.device
+        data_type = "video"
+        num_videos_per_prompt = 1
+
+        text_inputs = text_encoder.text2tokens(prompt, data_type=data_type)
+
+        if clip_skip is None:
+            prompt_outputs = text_encoder.encode(text_inputs,
+                                                 data_type="video",
+                                                 device=device,
+                                                 semantic_images=semantic_images)
+            prompt_embeds = prompt_outputs.hidden_state
+        else:
+            prompt_outputs = text_encoder.encode(
+                text_inputs,
+                output_hidden_states=True,
+                data_type=data_type,
+                device=device,
+            )
+            prompt_embeds = prompt_outputs.hidden_states_list[-(clip_skip + 1)]
+
+            prompt_embeds = text_encoder.model.text_model.final_layer_norm(
+                prompt_embeds)
+
+        attention_mask = prompt_outputs.attention_mask
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+            bs_embed, seq_len = attention_mask.shape
+            attention_mask = attention_mask.repeat(1, num_videos_per_prompt)
+            attention_mask = attention_mask.view(
+                bs_embed * num_videos_per_prompt, seq_len)
+
+        if text_encoder is not None:
+            prompt_embeds_dtype = text_encoder.dtype
+        elif self.transformer is not None:
+            prompt_embeds_dtype = self.transformer.dtype
+        else:
+            prompt_embeds_dtype = prompt_embeds.dtype
+
+        prompt_embeds = prompt_embeds.to(dtype=prompt_embeds_dtype,
+                                         device=device)
+
+        if prompt_embeds.ndim == 2:
+            bs_embed, _ = prompt_embeds.shape
+            # duplicate text embeddings for each generation per prompt, using mps friendly method
+            prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt)
+            prompt_embeds = prompt_embeds.view(
+                bs_embed * num_videos_per_prompt, -1)
+        else:
+            bs_embed, seq_len, _ = prompt_embeds.shape
+            # duplicate text embeddings for each generation per prompt, using mps friendly method
+            prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
+            prompt_embeds = prompt_embeds.view(
+                bs_embed * num_videos_per_prompt, seq_len, -1)
+        return (prompt_embeds, attention_mask)
+
+
+    def encode_prompt(self, prompt, semantic_images=None):
+        prompt_embeds, attention_mask = self.encode_i2v(prompt, self.text_encoder, semantic_images=semantic_images)
+        prompt_embeds_2, attention_mask_2 = self.encode_i2v(
+            prompt, self.text_encoder_2)
+        prompt_embeds_2 = F.pad(
+            prompt_embeds_2,
+            (0, prompt_embeds.shape[2] - prompt_embeds_2.shape[1]),
+            value=0,
+        ).unsqueeze(1)
+        prompt_embeds = torch.cat([prompt_embeds_2, prompt_embeds], dim=1)
+        return prompt_embeds, attention_mask
+
 
 
 class HunyuanTextEncoderWrapper(nn.Module):
@@ -363,7 +485,7 @@ def load_transformer(
                                               dit_model_name_or_path)
         if master_weight_type == torch.bfloat16:
             transformer = transformer.bfloat16()
-    elif model_type == "hunyuan_audio" or model_type == "hunyuan_audio_i2v":
+    elif model_type == "hunyuan_audio":
         transformer = HYVideoDiffusionTransformerAudio(
             in_channels=16,
             out_channels=16,
@@ -374,6 +496,15 @@ def load_transformer(
                                               dit_model_name_or_path)
         if master_weight_type == torch.bfloat16:
             transformer = transformer.bfloat16()
+    elif model_type == "hunyuan_audio_i2v":
+        transformer = HYVideoDiffusionTransformerAudioI2V(
+            in_channels=16,
+            out_channels=16,
+            **hunyuan_config,
+            dtype=master_weight_type,
+        )
+        transformer = load_hunyuan_audio_state_dict(transformer,
+                                              dit_model_name_or_path)
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
     return transformer
@@ -423,13 +554,16 @@ def load_vae(model_type, pretrained_model_name_or_path):
     return vae, autocast_type, fps
 
 
-def load_text_encoder(model_type, pretrained_model_name_or_path, device):
+def load_text_encoder(model_type, pretrained_model_name_or_path, device, args):
     if model_type == "mochi":
         text_encoder = MochiTextEncoderWrapper(pretrained_model_name_or_path,
                                                device)
-    elif model_type == "hunyuan" or "hunyuan_hf":
+    elif model_type == "hunyuan" or model_type == "hunyuan_hf":
         text_encoder = HunyuanTextEncoderWrapper(pretrained_model_name_or_path,
                                                  device)
+    elif model_type == "hunyuan_audio_i2v":
+        text_encoder = HunyuanI2VTextEncoderWrapper(pretrained_model_name_or_path,
+                                                 device, args)
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
     return text_encoder
@@ -446,6 +580,8 @@ def get_no_split_modules(transformer):
         return (MMDoubleStreamBlock, MMSingleStreamBlock)
     elif isinstance(transformer, HYVideoDiffusionTransformerAudio):
         return (MMDoubleStreamBlockAudio, MMSingleStreamBlockAudio)
+    elif isinstance(transformer, HYVideoDiffusionTransformerAudioI2V):
+        return (MMDoubleStreamBlockAudioI2V, MMSingleStreamBlockAudioI2V)
     else:
         raise ValueError(f"Unsupported transformer type: {type(transformer)}")
 
